@@ -340,6 +340,13 @@ client.on(Events.MessageCreate, async (message) => {
   );
 });
 
+const http = require("http");
+
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Bot is alive!");
+}).listen(3000, () => console.log("🌐 HTTP server running on port 3000"));
+
 client.login(TOKEN).then(() => {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   rest
