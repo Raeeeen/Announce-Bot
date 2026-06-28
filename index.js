@@ -7,40 +7,87 @@ const {
   Events,
   PermissionFlagsBits,
   ChannelType,
+  AttachmentBuilder,
 } = require("discord.js");
-const fs = require("fs");
-const path = require("path");
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: f }) => f(...args));
+const mongoose = require("mongoose");
 require("dotenv").config();
-
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-const SCHEDULE_FILE = path.join(__dirname, "schedules.json");
+const MONGODB_URI = process.env.MONGODB_URI;
 
-if (!TOKEN || !CLIENT_ID) {
-  console.error("❌ Missing DISCORD_TOKEN or CLIENT_ID in .env");
+if (!TOKEN || !CLIENT_ID || !MONGODB_URI) {
+  console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or MONGODB_URI in .env");
   process.exit(1);
 }
 
-function loadSchedules() {
-  if (!fs.existsSync(SCHEDULE_FILE)) return [];
+// ─── MongoDB Schema ───────────────────────────────────────────────────────────
+
+const scheduleSchema = new mongoose.Schema({
+  id:          { type: String, required: true, unique: true },
+  channelId:   { type: String, required: true },
+  title:       { type: String, required: true },
+  sendAt:      { type: Number, required: true },
+  mention:     { type: String, default: null },
+  guildId:     { type: String, required: true },
+  scheduledBy: { type: String, required: true },
+  scheduledAt: { type: Number, required: true },
+  message:     { type: String, default: "" },
+  images:      { type: [String], default: [] },
+  messageId:   { type: String, default: null },
+  deleteAt:    { type: Number, default: null },
+});
+
+const Schedule = mongoose.model("Schedule", scheduleSchema);
+
+// ─── DB Helpers ───────────────────────────────────────────────────────────────
+
+async function loadSchedules() {
   try {
-    return JSON.parse(fs.readFileSync(SCHEDULE_FILE, "utf-8"));
-  } catch {
-    return [];
+    return await Schedule.find({}).lean();
+  } catch (err) {
+    console.error("⚠️ Failed to load schedules from MongoDB:", err.message);
+    throw err;
   }
 }
 
-function saveSchedules(schedules) {
-  fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(schedules, null, 2));
+async function saveSchedule(entry) {
+  try {
+    await Schedule.findOneAndUpdate({ id: entry.id }, entry, {
+      upsert: true,
+      new: true,
+    });
+  } catch (err) {
+    console.error("❌ Failed to save schedule to MongoDB:", err.message);
+  }
 }
+
+async function deleteSchedule(entryId) {
+  try {
+    await Schedule.deleteOne({ id: entryId });
+  } catch (err) {
+    console.error("❌ Failed to delete schedule from MongoDB:", err.message);
+  }
+}
+
+async function updateSchedule(entryId, fields) {
+  try {
+    await Schedule.findOneAndUpdate({ id: entryId }, { $set: fields });
+  } catch (err) {
+    console.error("❌ Failed to update schedule in MongoDB:", err.message);
+  }
+}
+
+// ─── Discord Client ───────────────────────────────────────────────────────────
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.DirectMessages, 
-    GatewayIntentBits.MessageContent, 
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
   ],
-  partials: ["CHANNEL"], 
+  partials: ["CHANNEL"],
 });
 
 const commands = [
@@ -58,7 +105,9 @@ const commands = [
     .addStringOption((opt) =>
       opt
         .setName("time")
-        .setDescription("When to post it (e.g. 30m, 2h, 10s,)")
+        .setDescription(
+          "When to post (e.g. 30m, 2h, June 17 10PM PHT, 2025-06-17 22:00 PHT)",
+        )
         .setRequired(true),
     )
     .addStringOption((opt) =>
@@ -88,18 +137,48 @@ const commands = [
     ),
 ].map((cmd) => cmd.toJSON());
 
+// ─── Time Parsing ─────────────────────────────────────────────────────────────
+
 function parseTime(input) {
-  const relative = input.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+  const trimmed = input.trim();
+
+  const relative = trimmed.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
   if (relative && (relative[1] || relative[2] || relative[3])) {
     const hours = parseInt(relative[1] || 0);
     const minutes = parseInt(relative[2] || 0);
     const seconds = parseInt(relative[3] || 0);
-    return (
-      Date.now() + hours * 60 * 60 * 1000 + minutes * 60 * 1000 + seconds * 1000
-    );
+    return Date.now() + hours * 3600000 + minutes * 60000 + seconds * 1000;
   }
-  const absolute = new Date(input + " UTC+8");
-  if (!isNaN(absolute.getTime())) return absolute.getTime();
+
+  const tzOffsets = {
+    PHT: "+08:00", PST: "+08:00", JST: "+09:00", KST: "+09:00",
+    SGT: "+08:00", HKT: "+08:00", ICT: "+07:00", WIB: "+07:00",
+    IST: "+05:30", PKT: "+05:00", GMT: "+00:00", UTC: "+00:00",
+    EST: "-05:00", EDT: "-04:00", CDT: "-05:00", CST: "-06:00",
+    MST: "-07:00", MDT: "-06:00", PDT: "-07:00",
+  };
+
+  let normalized = trimmed;
+  let offsetStr = "+08:00"; // default: PHT
+
+  const tzMatch = normalized.match(/\b([A-Z]{2,5})\s*$/);
+  if (tzMatch && tzOffsets[tzMatch[1]]) {
+    offsetStr = tzOffsets[tzMatch[1]];
+    normalized = normalized.slice(0, normalized.lastIndexOf(tzMatch[1])).trim();
+  }
+
+  normalized = normalized.replace(/(\d)(AM|PM)/gi, "$1 $2");
+
+  if (!/\b\d{4}\b/.test(normalized)) {
+    normalized = `${normalized} ${new Date().getFullYear()}`;
+  }
+
+  const attempt = new Date(`${normalized} ${offsetStr}`);
+  if (!isNaN(attempt.getTime())) return attempt.getTime();
+
+  const fallback = new Date(trimmed);
+  if (!isNaN(fallback.getTime())) return fallback.getTime();
+
   return null;
 }
 
@@ -107,7 +186,10 @@ function genId() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+// ─── Timers ───────────────────────────────────────────────────────────────────
+
 const activeTimers = new Map();
+const deleteTimers = new Map();
 const awaitingDM = new Map();
 
 async function scheduleAnnouncement(entry) {
@@ -119,22 +201,37 @@ async function scheduleAnnouncement(entry) {
       const channel = await client.channels.fetch(entry.channelId);
       if (!channel) return;
 
+      const textContent = `${entry.mention ? entry.mention + "\n" : ""}**${entry.title}**\n\n${entry.message}`;
+
+      const files = [];
+      if (entry.images && entry.images.length > 0) {
+        for (const url of entry.images) {
+          try {
+            const res = await fetch(url);
+            if (res.ok) {
+              const buffer = Buffer.from(await res.arrayBuffer());
+              const filename = url.split("/").pop().split("?")[0] || "image.png";
+              files.push(new AttachmentBuilder(buffer, { name: filename }));
+            }
+          } catch (fetchErr) {
+            console.warn(`⚠️ Could not fetch image ${url}:`, fetchErr.message);
+          }
+        }
+      }
+
       const msg = await channel.send({
-        content: `${entry.mention ? entry.mention + "\n" : ""}**${entry.title}**\n\n${entry.message}`,
+        content: textContent,
+        files,
         allowedMentions: { parse: ["roles", "users", "everyone"] },
       });
 
-      setTimeout(
-        async () => {
-          try {
-            await msg.delete();
-          } catch {}
-          const schedules = loadSchedules().filter((s) => s.id !== entry.id);
-          saveSchedules(schedules);
-          activeTimers.delete(entry.id);
-        },
-        60 * 60 * 1000,
-      );
+      const deleteDelay = 60 * 60 * 1000; // 1 hour
+      await updateSchedule(entry.id, {
+        messageId: msg.id,
+        deleteAt: Date.now() + deleteDelay,
+      });
+
+      scheduleDelete(entry.id, msg.id, entry.channelId, deleteDelay);
     } catch (err) {
       console.error(`❌ Failed to send announcement ${entry.id}:`, err);
     }
@@ -143,27 +240,71 @@ async function scheduleAnnouncement(entry) {
   activeTimers.set(entry.id, sendTimer);
 }
 
-function restoreSchedules() {
-  const schedules = loadSchedules();
-  const now = Date.now();
-  const valid = schedules.filter((s) => s.sendAt > now);
-  if (valid.length !== schedules.length) saveSchedules(valid);
-  for (const entry of valid) scheduleAnnouncement(entry);
-  if (valid.length > 0)
-    console.log(`🔁 Restored ${valid.length} pending announcement(s)`);
+function scheduleDelete(entryId, messageId, channelId, delay) {
+  const t = setTimeout(async () => {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      const msg = await channel.messages.fetch(messageId);
+      await msg.delete();
+    } catch {}
+
+    await deleteSchedule(entryId);
+    activeTimers.delete(entryId);
+    deleteTimers.delete(entryId);
+  }, delay);
+
+  deleteTimers.set(entryId, t);
 }
+
+async function restoreSchedules() {
+  let schedules;
+  try {
+    schedules = await loadSchedules();
+  } catch {
+    console.error("⚠️ Skipping schedule restore — DB could not be read.");
+    return;
+  }
+
+  const now = Date.now();
+  const toDelete = [];
+
+  for (const entry of schedules) {
+    if (!entry || !entry.id || !entry.channelId || !entry.sendAt) {
+      console.warn("⚠️ Skipping malformed schedule entry:", entry);
+      continue;
+    }
+
+    if (entry.messageId && entry.deleteAt) {
+      if (entry.deleteAt > now) {
+        scheduleDelete(entry.id, entry.messageId, entry.channelId, entry.deleteAt - now);
+      } else {
+        toDelete.push(entry.id);
+      }
+    } else if (entry.sendAt > now) {
+      scheduleAnnouncement(entry);
+    } else {
+      console.warn(`⚠️ Missed announcement ${entry.id} — dropping.`);
+      toDelete.push(entry.id);
+    }
+  }
+
+  for (const id of toDelete) await deleteSchedule(id);
+
+  console.log(`🔁 Restored ${schedules.length - toDelete.length} / ${schedules.length} announcement(s)`);
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
 
 client.once(Events.ClientReady, () => {
   console.log(`🤖 Bot ready: ${client.user.tag}`);
-  restoreSchedules();
+  restoreSchedules().catch((err) =>
+    console.error("❌ Failed to restore schedules:", err),
+  );
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  //announce
-  if (
-    interaction.isChatInputCommand() &&
-    interaction.commandName === "announce"
-  ) {
+  // /announce
+  if (interaction.isChatInputCommand() && interaction.commandName === "announce") {
     const channel = interaction.options.getChannel("channel");
     const timeInput = interaction.options.getString("time");
     const title = interaction.options.getString("title");
@@ -172,11 +313,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const testParse = parseTime(timeInput);
     if (!testParse) {
       return interaction.reply({
-        content:
-          "❌ Invalid time format. Use `30m`, `2h`, `10s`, or `YYYY-MM-DD HH:mm`.",
+        content: "❌ Invalid time format. Try `30m`, `2h`, `June 17 10PM PHT`, or `2025-06-17 22:00 PHT`.",
         ephemeral: true,
       });
     }
+
+    if (testParse <= Date.now()) {
+      return interaction.reply({
+        content: "❌ That time is already in the past! Please pick a future date/time.",
+        ephemeral: true,
+      });
+    }
+
+    await interaction.reply({ content: `📬 Check your DMs!`, ephemeral: true });
 
     awaitingDM.set(interaction.user.id, {
       channelId: channel.id,
@@ -192,32 +341,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const user = await client.users.fetch(interaction.user.id);
       await user.send(
         `📝 **Please send me your announcement message now!**\n\n` +
-          `> Title: **${title}**\n` +
-          `> Channel: <#${channel.id}>\n\n` +
-          `⚠️ Type \`cancel\` to cancel.`,
+        `> Title: **${title}**\n` +
+        `> Channel: <#${channel.id}>\n\n` +
+        `📎 You can also attach an image — just send it along with your message (or alone).\n` +
+        `⚠️ Type \`cancel\` to cancel.`,
       );
-      return interaction.reply({
-        content: `📬 Check your DMs!`,
-        ephemeral: true,
-      });
     } catch (err) {
       awaitingDM.delete(interaction.user.id);
-      return interaction.reply({
-        content:
-          "❌ I couldn't DM you. Please enable DMs from server members and try again.",
-        ephemeral: true,
+      await interaction.editReply({
+        content: "❌ I couldn't DM you. Please enable DMs from server members and try again.",
       });
     }
   }
 
-  // announcements
-  if (
-    interaction.isChatInputCommand() &&
-    interaction.commandName === "announcements"
-  ) {
+  // /announcements
+  if (interaction.isChatInputCommand() && interaction.commandName === "announcements") {
     await interaction.deferReply({ ephemeral: true });
 
-    const schedules = loadSchedules().filter(
+    let allSchedules;
+    try {
+      allSchedules = await loadSchedules();
+    } catch {
+      return interaction.editReply("❌ Failed to load announcements from database.");
+    }
+
+    const schedules = allSchedules.filter(
       (s) => s.guildId === interaction.guildId && s.sendAt > Date.now(),
     );
 
@@ -229,17 +377,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .map((s) => {
         const d = new Date(s.sendAt).toLocaleString("en-PH", {
           timeZone: "Asia/Manila",
-          year: "numeric",
-          month: "long",
-          day: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: true,
+          year: "numeric", month: "long", day: "numeric",
+          hour: "2-digit", minute: "2-digit", hour12: true,
         });
+        const preview = (s.message || "").substring(0, 80);
+        const ellipsis = (s.message || "").length > 80 ? "..." : "";
         return (
           `**ID:** \`${s.id}\`\n` +
           `📌 <#${s.channelId}> • 🕐 \`${d} PHT\`\n` +
-          `💬 ${s.message.substring(0, 80)}${s.message.length > 80 ? "..." : ""}`
+          `💬 ${preview}${ellipsis}`
         );
       })
       .join("\n\n");
@@ -247,36 +393,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.editReply(`📋 **Pending Announcements:**\n\n${list}`);
   }
 
-  // cancel announce
-  if (
-    interaction.isChatInputCommand() &&
-    interaction.commandName === "cancelannounce"
-  ) {
+  // /cancelannounce
+  if (interaction.isChatInputCommand() && interaction.commandName === "cancelannounce") {
     await interaction.deferReply({ ephemeral: true });
 
     const id = interaction.options.getString("id").toUpperCase();
-    const schedules = loadSchedules();
+
+    let schedules;
+    try {
+      schedules = await loadSchedules();
+    } catch {
+      return interaction.editReply("❌ Failed to load announcements from database.");
+    }
+
     const entry = schedules.find((s) => s.id === id);
-
     if (!entry) {
-      return interaction.editReply(
-        `❌ No announcement found with ID \`${id}\`.`,
-      );
+      return interaction.editReply(`❌ No announcement found with ID \`${id}\`.`);
     }
 
-    if (activeTimers.has(id)) {
-      clearTimeout(activeTimers.get(id));
-      activeTimers.delete(id);
-    }
+    if (activeTimers.has(id)) { clearTimeout(activeTimers.get(id)); activeTimers.delete(id); }
+    if (deleteTimers.has(id)) { clearTimeout(deleteTimers.get(id)); deleteTimers.delete(id); }
 
-    saveSchedules(schedules.filter((s) => s.id !== id));
-    return interaction.editReply(
-      `🗑️ Announcement \`${id}\` has been cancelled.`,
-    );
+    await deleteSchedule(id);
+    return interaction.editReply(`🗑️ Announcement \`${id}\` has been cancelled.`);
   }
 });
 
-// Listen for DM
+// Listen for DMs
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (message.guild) return;
@@ -284,9 +427,7 @@ client.on(Events.MessageCreate, async (message) => {
   const userId = message.author.id;
 
   if (!awaitingDM.has(userId)) {
-    return message.reply(
-      "ℹ️ Use `/announce` in the server first to schedule an announcement.",
-    );
+    return message.reply("ℹ️ Use `/announce` in the server first to schedule an announcement.");
   }
 
   if (message.content.trim().toLowerCase() === "cancel") {
@@ -298,59 +439,71 @@ client.on(Events.MessageCreate, async (message) => {
   awaitingDM.delete(userId);
 
   const sendAt = parseTime(pending.timeInput);
-
   if (!sendAt || sendAt <= Date.now()) {
     return message.reply(
-      "❌ The scheduled time has already passed. Please use `/announce` again with a longer delay.",
+      "❌ The scheduled time has already passed. Please use `/announce` again with a future date/time.",
     );
   }
+
+  const imageAttachments = [...message.attachments.values()]
+    .filter((a) => a.contentType && a.contentType.startsWith("image/"))
+    .map((a) => a.url);
 
   const entry = {
     id: genId(),
     channelId: pending.channelId,
     title: pending.title,
-    sendAt, // ← fresh timestamp
+    sendAt,
     mention: pending.mention ?? null,
     guildId: pending.guildId,
     scheduledBy: pending.scheduledBy,
     scheduledAt: pending.scheduledAt,
     message: message.content,
+    images: imageAttachments,
   };
 
-  const schedules = loadSchedules();
-  schedules.push(entry);
-  saveSchedules(schedules);
+  await saveSchedule(entry);
   scheduleAnnouncement(entry);
 
   const sendDate = new Date(entry.sendAt).toLocaleString("en-PH", {
     timeZone: "Asia/Manila",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
+    year: "numeric", month: "long", day: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: true,
   });
+
+  const imageNote = entry.images.length > 0 ? `\n🖼️ Images attached: ${entry.images.length}` : "";
 
   return message.reply(
     `✅ Announcement **#${entry.id}** scheduled!\n` +
-      `📌 Channel: <#${entry.channelId}>\n` +
-      `🕐 Sends at: \`${sendDate} PHT\`\n` +
-      `🗑️ Auto-deletes 1 hour after posting.`,
+    `📌 Channel: <#${entry.channelId}>\n` +
+    `🕐 Sends at: \`${sendDate} PHT\`\n` +
+    `🗑️ Auto-deletes 1 hour after posting.${imageNote}`,
   );
 });
 
+// ─── HTTP Keep-Alive (for Railway health check) ───────────────────────────────
+
 const http = require("http");
+http
+  .createServer((req, res) => { res.writeHead(200); res.end("Bot is alive!"); })
+  .listen(process.env.PORT || 3000, () =>
+    console.log(`🌐 HTTP server running on port ${process.env.PORT || 3000}`),
+  );
 
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("Bot is alive!");
-}).listen(3000, () => console.log("🌐 HTTP server running on port 3000"));
+// ─── Connect to MongoDB, then start bot ──────────────────────────────────────
 
-client.login(TOKEN).then(() => {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-  rest
-    .put(Routes.applicationCommands(CLIENT_ID), { body: commands })
-    .then(() => console.log("✅ Slash commands registered"))
-    .catch((err) => console.error("❌ Command registration failed:", err));
-});
+mongoose
+  .connect(MONGODB_URI)
+  .then(() => {
+    console.log("✅ Connected to MongoDB Atlas");
+    return client.login(TOKEN);
+  })
+  .then(() => {
+    const rest = new REST({ version: "10" }).setToken(TOKEN);
+    return rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  })
+  .then(() => console.log("✅ Slash commands registered"))
+  .catch((err) => {
+    console.error("❌ Startup error:", err);
+    process.exit(1);
+  });
