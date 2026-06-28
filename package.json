@@ -22,7 +22,7 @@
     "mongoose": "^9.7.3",
     "node-fetch": "^3.3.2",
     "opusscript": "^0.0.8",
-    "youtube-sr": "^4.3.12",
+    "play-dl": "^1.9.7",
     "ytdl-core": "^4.11.5"
   }
 }

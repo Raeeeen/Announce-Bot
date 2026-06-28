@@ -28,33 +28,6 @@ const mongoose = require("mongoose");
 const gtts = require("gtts");
 const fs = require("fs");
 const path = require("path");
-const ytdl = require("@distube/ytdl-core");
-
-// Convert Netscape cookie format to ytdl-core JSON format
-function netscapeCookiesToJson(netscapeStr) {
-  return netscapeStr
-    .split("\n")
-    .filter((line) => line && !line.startsWith("#"))
-    .map((line) => {
-      const parts = line.split("\t");
-      if (parts.length < 7) return null;
-      const [domain, , path, secure, expiration, name, value] = parts;
-      return {
-        domain,
-        path,
-        secure: secure === "TRUE",
-        expires: parseInt(expiration) || undefined,
-        name: name.trim(),
-        value: value?.trim() || "",
-        hostOnly: false,
-        httpOnly: false,
-        sameSite: "unspecified",
-        session: parseInt(expiration) === 0,
-        storeId: "0",
-      };
-    })
-    .filter(Boolean);
-}
 
 async function getSpotifyTrackName(url) {
   const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
@@ -71,7 +44,10 @@ async function getSpotifyTrackName(url) {
     },
     body: "grant_type=client_credentials",
   });
-  const { access_token } = await tokenRes.json();
+
+  const rawText = await tokenRes.text(); // ← read as text first
+  console.log("🎵 Spotify token response:", rawText); // ← log it
+  const { access_token } = JSON.parse(rawText);
 
   const trackId = url.split("/track/")[1]?.split("?")[0];
   if (!trackId) throw new Error("Invalid Spotify track URL");
@@ -83,12 +59,8 @@ async function getSpotifyTrackName(url) {
   return `${track.name} ${track.artists[0].name}`;
 }
 
-const agent = ytdl.createAgent(
-  netscapeCookiesToJson(process.env.YOUTUBE_COOKIE),
-);
 const ttsQueues = new Map(); // guildId → string[]
 const ttsPlaying = new Map(); // guildId → true (semaphore)
-const YouTubeSR = require("youtube-sr").default;
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -574,20 +546,22 @@ async function playNextSong(guildId) {
   }
 
   const song = queue[0];
-  console.log(`🎵 Attempting to stream: ${song.url}`);
+  console.log(`🎵 Now playing: ${song.title}`);
   const connection = getVoiceConnection(guildId);
   if (!connection) return;
 
   try {
-    const stream = ytdl(song.url, {
-      filter: "audioonly",
-      quality: "highestaudio",
-      highWaterMark: 1 << 25,
-      agent,
+    const playdl = require("play-dl");
+    const results = await playdl.search(song.searchQuery, {
+      source: { soundcloud: "tracks" },
+      limit: 1,
     });
 
-    const resource = createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
+    if (!results.length) throw new Error("No SoundCloud results found");
+
+    const stream = await playdl.stream(results[0].url);
+    const resource = createAudioResource(stream.stream, {
+      inputType: stream.type,
     });
 
     let player = musicPlayers.get(guildId);
@@ -609,7 +583,6 @@ async function playNextSong(guildId) {
     }
 
     player.play(resource);
-    console.log(`🎵 Now playing: ${song.title}`);
   } catch (e) {
     console.error("❌ Failed to play song:", e.message);
     queue.shift();
@@ -745,7 +718,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
-    // Join if not already in
     if (!voiceStates.has(interaction.guildId)) {
       try {
         await joinAndWatch(
@@ -760,36 +732,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     try {
-      let songUrl, songTitle;
-
+      let searchQuery;
       const isSpotifyUrl = query.includes("spotify.com");
-      const ytMatch = query.match(/(?:v=|youtu\.be\/)([^?&]+)/);
 
       if (isSpotifyUrl) {
-        const searchQuery = await getSpotifyTrackName(query);
-        const results = await YouTubeSR.search(searchQuery, { limit: 1 });
-        if (!results.length)
-          return interaction.editReply("❌ No results found.");
-        songUrl = results[0].url;
-        songTitle = results[0].title;
-      } else if (ytMatch) {
-        songUrl = `https://www.youtube.com/watch?v=${ytMatch[1]}`;
-        const info = await ytdl.getInfo(songUrl, { agent });
-        songTitle = info.videoDetails.title;
+        searchQuery = await getSpotifyTrackName(query);
       } else {
-        // Plain search term
-        const results = await YouTubeSR.search(query, { limit: 1 });
-        if (!results.length)
-          return interaction.editReply("❌ No results found.");
-        songUrl = results[0].url;
-        songTitle = results[0].title;
+        searchQuery = query;
       }
+
+      // Search SoundCloud to verify and get real title
+      const playdl = require("play-dl");
+      const results = await playdl.search(searchQuery, {
+        source: { soundcloud: "tracks" },
+        limit: 1,
+      });
+
+      if (!results.length)
+        return interaction.editReply("❌ No results found on SoundCloud.");
+
+      const songTitle = results[0].title;
 
       if (!musicQueues.has(interaction.guildId))
         musicQueues.set(interaction.guildId, []);
       musicQueues
         .get(interaction.guildId)
-        .push({ title: songTitle, url: songUrl });
+        .push({ title: songTitle, searchQuery });
 
       const isPlaying =
         musicPlayers.get(interaction.guildId)?.state?.status ===
@@ -800,7 +768,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (err) {
       console.error("❌ Play error:", err.message);
       return interaction.editReply(
-        "❌ Failed to fetch that song. Try a different link or search term.",
+        "❌ Failed to fetch that song. Try a different search term.",
       );
     }
   }
