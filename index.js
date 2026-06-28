@@ -1,3 +1,5 @@
+require("ffmpeg-static");
+
 const {
   Client,
   GatewayIntentBits,
@@ -123,10 +125,11 @@ async function processQueue(guildId) {
   }
 
   const text = queue.shift();
+  console.log(`🔊 TTS playing: "${text.substring(0, 50)}..."`); // ← add this
   const connection = getVoiceConnection(guildId);
 
   if (!connection) {
-    // Bot left voice — clear everything
+    console.log("❌ TTS: no voice connection found"); // ← add this
     ttsQueues.delete(guildId);
     ttsPlaying.delete(guildId);
     return;
@@ -140,9 +143,10 @@ async function processQueue(guildId) {
       if (err) {
         console.error("❌ TTS generation failed:", err.message);
         resolve();
-        return processQueue(guildId); // skip to next
+        return processQueue(guildId);
       }
 
+      console.log(`✅ TTS file saved: ${tmpFile}`); // ← add this
       try {
         const player = createAudioPlayer();
         const resource = createAudioResource(tmpFile);
@@ -154,7 +158,7 @@ async function processQueue(guildId) {
             fs.unlinkSync(tmpFile);
           } catch {}
           resolve();
-          processQueue(guildId); // play next in queue
+          processQueue(guildId);
         };
 
         player.once(AudioPlayerStatus.Idle, cleanup);
