@@ -28,19 +28,67 @@ const mongoose = require("mongoose");
 const gtts = require("gtts");
 const fs = require("fs");
 const path = require("path");
-const playdl = require("play-dl");
+const ytdl = require("@distube/ytdl-core");
 
-const cookiePath = path.join("/tmp", "yt_cookies.txt");
-fs.writeFileSync(cookiePath, process.env.YOUTUBE_COOKIE);
+// Convert Netscape cookie format to ytdl-core JSON format
+function netscapeCookiesToJson(netscapeStr) {
+  return netscapeStr
+    .split("\n")
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => {
+      const parts = line.split("\t");
+      if (parts.length < 7) return null;
+      const [domain, , path, secure, expiration, name, value] = parts;
+      return {
+        domain,
+        path,
+        secure: secure === "TRUE",
+        expires: parseInt(expiration) || undefined,
+        name: name.trim(),
+        value: value?.trim() || "",
+        hostOnly: false,
+        httpOnly: false,
+        sameSite: "unspecified",
+        session: parseInt(expiration) === 0,
+        storeId: "0",
+      };
+    })
+    .filter(Boolean);
+}
 
-playdl.setToken({
-  youtube: {
-    cookie: cookiePath,
-  },
-});
+async function getSpotifyTrackName(url) {
+  const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization:
+        "Basic " +
+        Buffer.from(
+          process.env.SPOTIFY_CLIENT_ID +
+            ":" +
+            process.env.SPOTIFY_CLIENT_SECRET,
+        ).toString("base64"),
+    },
+    body: "grant_type=client_credentials",
+  });
+  const { access_token } = await tokenRes.json();
+
+  const trackId = url.split("/track/")[1]?.split("?")[0];
+  if (!trackId) throw new Error("Invalid Spotify track URL");
+
+  const trackRes = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, {
+    headers: { Authorization: `Bearer ${access_token}` },
+  });
+  const track = await trackRes.json();
+  return `${track.name} ${track.artists[0].name}`;
+}
+
+const agent = ytdl.createAgent(
+  netscapeCookiesToJson(process.env.YOUTUBE_COOKIE),
+);
 const ttsQueues = new Map(); // guildId → string[]
 const ttsPlaying = new Map(); // guildId → true (semaphore)
-
+const YouTubeSR = require("youtube-sr").default;
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -526,15 +574,20 @@ async function playNextSong(guildId) {
   }
 
   const song = queue[0];
+  console.log(`🎵 Attempting to stream: ${song.url}`);
   const connection = getVoiceConnection(guildId);
   if (!connection) return;
 
   try {
-    const stream = await playdl.stream(song.url, {
-      discordPlayerCompatibility: true,
+    const stream = ytdl(song.url, {
+      filter: "audioonly",
+      quality: "highestaudio",
+      highWaterMark: 1 << 25,
+      agent,
     });
-    const resource = createAudioResource(stream.stream, {
-      inputType: stream.type,
+
+    const resource = createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
     });
 
     let player = musicPlayers.get(guildId);
@@ -713,21 +766,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const ytMatch = query.match(/(?:v=|youtu\.be\/)([^?&]+)/);
 
       if (isSpotifyUrl) {
-        const spotifyData = await playdl.spotify(query);
-        const searchQuery = `${spotifyData.name} ${spotifyData.artists[0].name}`;
-        const results = await playdl.search(searchQuery, { limit: 1 });
+        const searchQuery = await getSpotifyTrackName(query);
+        const results = await YouTubeSR.search(searchQuery, { limit: 1 });
         if (!results.length)
           return interaction.editReply("❌ No results found.");
         songUrl = results[0].url;
         songTitle = results[0].title;
       } else if (ytMatch) {
-        // Clean canonical YouTube URL — strips ?si= and other tracking params
         songUrl = `https://www.youtube.com/watch?v=${ytMatch[1]}`;
-        const info = await playdl.video_info(songUrl);
-        songTitle = info.video_details.title;
+        const info = await ytdl.getInfo(songUrl, { agent });
+        songTitle = info.videoDetails.title;
       } else {
         // Plain search term
-        const results = await playdl.search(query, { limit: 1 });
+        const results = await YouTubeSR.search(query, { limit: 1 });
         if (!results.length)
           return interaction.editReply("❌ No results found.");
         songUrl = results[0].url;
