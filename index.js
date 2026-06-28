@@ -41,15 +41,7 @@ const conversationHistory = new Map();
 const playdl = require("play-dl");
 playdl.setToken({
   youtube: {
-    cookie: process.env.YOUTUBE_COOKIE?.split("\n")
-      .filter((line) => !line.startsWith("#") && line.trim())
-      .map((line) => {
-        const parts = line.split("\t");
-        if (parts.length < 7) return null;
-        return `${parts[5]}=${parts[6]}`;
-      })
-      .filter(Boolean)
-      .join("; "),
+    cookie: process.env.YOUTUBE_COOKIE,
   },
 });
 const musicQueues = new Map(); // guildId → [{ title, url }]
