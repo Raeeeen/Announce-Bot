@@ -559,21 +559,12 @@ async function playNextSong(guildId) {
   }
 
   const song = queue[0];
-  console.log(`🎵 Now playing: ${song.searchQuery}`);
+  console.log(`🎵 Now playing: ${song.title}`);
   const connection = getVoiceConnection(guildId);
   if (!connection) return;
 
   try {
-    const results = await playdl.search(song.searchQuery, {
-      source: { soundcloud: "tracks" },
-      limit: 1,
-    });
-
-    if (!results.length) throw new Error("No SoundCloud results found");
-
-    console.log(`🎵 Streaming from: ${results[0].url}`);
-
-    const stream = await playdl.stream(results[0].url, {
+    const stream = await playdl.stream(song.url, {
       highWaterMark: 1 << 25,
     });
 
@@ -582,7 +573,6 @@ async function playNextSong(guildId) {
       inlineVolume: false,
     });
 
-    // Always create a fresh player per song to avoid state issues
     const oldPlayer = musicPlayers.get(guildId);
     if (oldPlayer) {
       oldPlayer.removeAllListeners();
@@ -778,7 +768,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         musicQueues.set(interaction.guildId, []);
       musicQueues
         .get(interaction.guildId)
-        .push({ title: songTitle, searchQuery });
+        .push({ title: songTitle, url: songUrl });
 
       const isPlaying =
         musicPlayers.get(interaction.guildId)?.state?.status ===
