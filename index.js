@@ -39,6 +39,11 @@ const Groq = require("groq-sdk");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const conversationHistory = new Map();
 const playdl = require("play-dl");
+playdl.setToken({
+  youtube: {
+    cookie: process.env.YOUTUBE_COOKIE,
+  },
+});
 const musicQueues = new Map(); // guildId → [{ title, url }]
 const musicPlayers = new Map(); // guildId → AudioPlayer
 if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
