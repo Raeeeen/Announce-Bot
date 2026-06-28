@@ -20,6 +20,7 @@
     "mongodb": "^7.4.0",
     "mongoose": "^9.7.3",
     "node-fetch": "^3.3.2",
-    "opusscript": "^0.0.8"
+    "opusscript": "^0.0.8",
+    "play-dl": "^1.9.7"
   }
 }

@@ -19,6 +19,7 @@ const {
   VoiceConnectionStatus,
   entersState,
   getVoiceConnection,
+  StreamType,
 } = require("@discordjs/voice");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
@@ -37,7 +38,9 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const Groq = require("groq-sdk");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const conversationHistory = new Map();
-
+const playdl = require("play-dl");
+const musicQueues = new Map(); // guildId → [{ title, url }]
+const musicPlayers = new Map(); // guildId → AudioPlayer
 if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
   console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or MONGODB_URI in .env");
   process.exit(1);
@@ -273,6 +276,34 @@ const commands = [
     .setName("unlisten")
     .setDescription("Stop answering questions in the listened channel")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+
+  // Add to commands array
+  new SlashCommandBuilder()
+    .setName("clearchat")
+    .setDescription("Clear the conversation history in the listened channel")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+
+  new SlashCommandBuilder()
+    .setName("play")
+    .setDescription("Play a song from YouTube or Spotify")
+    .addStringOption((opt) =>
+      opt
+        .setName("query")
+        .setDescription("YouTube/Spotify link or search term")
+        .setRequired(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("skip")
+    .setDescription("Skip the current song"),
+
+  new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop music and clear the queue"),
+
+  new SlashCommandBuilder()
+    .setName("queue")
+    .setDescription("Show the current music queue"),
 ].map((cmd) => cmd.toJSON());
 
 // Time Parsing
@@ -477,6 +508,53 @@ client.once(Events.ClientReady, () => {
   );
 });
 
+async function playNextSong(guildId) {
+  const queue = musicQueues.get(guildId);
+  if (!queue || queue.length === 0) {
+    musicQueues.delete(guildId);
+    musicPlayers.delete(guildId);
+    return;
+  }
+
+  const song = queue[0];
+  const connection = getVoiceConnection(guildId);
+  if (!connection) return;
+
+  try {
+    const stream = await playdl.stream(song.url, {
+      discordPlayerCompatibility: true,
+    });
+    const resource = createAudioResource(stream.stream, {
+      inputType: stream.type,
+    });
+
+    let player = musicPlayers.get(guildId);
+    if (!player) {
+      player = createAudioPlayer();
+      musicPlayers.set(guildId, player);
+      connection.subscribe(player);
+
+      player.on(AudioPlayerStatus.Idle, () => {
+        queue.shift();
+        playNextSong(guildId);
+      });
+
+      player.on("error", (e) => {
+        console.error("❌ Music player error:", e.message);
+        queue.shift();
+        playNextSong(guildId);
+      });
+    }
+
+    player.play(resource);
+    console.log(`🎵 Now playing: ${song.title}`);
+  } catch (e) {
+    console.error("❌ Failed to play song:", e.message);
+    queue.shift();
+    playNextSong(guildId);
+  }
+}
+
 // Put this above the /join handler
 async function joinAndWatch(guildId, voiceChannel, guild) {
   const connection = joinVoiceChannel({
@@ -563,9 +641,142 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true,
       });
     }
+    const channelId = listenChannels.get(interaction.guildId);
+    conversationHistory.delete(channelId); // ← clear history on unlisten
     listenChannels.delete(interaction.guildId);
     return interaction.reply({
-      content: "🔇 Stopped listening.",
+      content: "🔇 Stopped listening and cleared conversation history.",
+      ephemeral: true,
+    });
+  }
+
+  // /clearchat
+  if (
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "clearchat"
+  ) {
+    const channelId = listenChannels.get(interaction.guildId);
+    if (!channelId) {
+      return interaction.reply({
+        content: "❌ No listened channel set.",
+        ephemeral: true,
+      });
+    }
+    conversationHistory.delete(channelId);
+    return interaction.reply({
+      content: "🧹 Conversation history cleared!",
+      ephemeral: true,
+    });
+  }
+
+  // /play
+  if (interaction.isChatInputCommand() && interaction.commandName === "play") {
+    await interaction.deferReply();
+
+    const query = interaction.options.getString("query");
+    const member = interaction.member;
+    const voiceChannel = member?.voice?.channel;
+
+    if (!voiceChannel) {
+      return interaction.editReply(
+        "❌ You need to be in a voice channel first.",
+      );
+    }
+
+    // Join if not already in
+    if (!voiceStates.has(interaction.guildId)) {
+      try {
+        await joinAndWatch(
+          interaction.guildId,
+          voiceChannel,
+          interaction.guild,
+        );
+        voiceStates.set(interaction.guildId, { channelId: voiceChannel.id });
+      } catch (err) {
+        return interaction.editReply("❌ Failed to join your voice channel.");
+      }
+    }
+
+    try {
+      let songUrl, songTitle;
+
+      // Check if it's a URL or a search term
+      const isUrl = query.startsWith("http");
+      if (isUrl) {
+        const info = await playdl.video_info(query);
+        songUrl = query;
+        songTitle = info.video_details.title;
+      } else {
+        const results = await playdl.search(query, { limit: 1 });
+        if (!results.length)
+          return interaction.editReply("❌ No results found.");
+        songUrl = results[0].url;
+        songTitle = results[0].title;
+      }
+
+      if (!musicQueues.has(interaction.guildId))
+        musicQueues.set(interaction.guildId, []);
+      musicQueues
+        .get(interaction.guildId)
+        .push({ title: songTitle, url: songUrl });
+
+      const isPlaying =
+        musicPlayers.get(interaction.guildId)?.state?.status ===
+        AudioPlayerStatus.Playing;
+      if (!isPlaying) playNextSong(interaction.guildId);
+
+      return interaction.editReply(`🎵 Added to queue: **${songTitle}**`);
+    } catch (err) {
+      console.error("❌ Play error:", err.message);
+      return interaction.editReply(
+        "❌ Failed to fetch that song. Try a different link or search term.",
+      );
+    }
+  }
+
+  // /skip
+  if (interaction.isChatInputCommand() && interaction.commandName === "skip") {
+    const player = musicPlayers.get(interaction.guildId);
+    if (!player)
+      return interaction.reply({
+        content: "❌ Nothing is playing.",
+        ephemeral: true,
+      });
+    player.stop(); // triggers Idle → playNextSong
+    return interaction.reply({ content: "⏭️ Skipped!", ephemeral: true });
+  }
+
+  // /stop
+  if (interaction.isChatInputCommand() && interaction.commandName === "stop") {
+    const player = musicPlayers.get(interaction.guildId);
+    if (!player)
+      return interaction.reply({
+        content: "❌ Nothing is playing.",
+        ephemeral: true,
+      });
+    musicQueues.delete(interaction.guildId);
+    player.stop();
+    musicPlayers.delete(interaction.guildId);
+    return interaction.reply({
+      content: "⏹️ Stopped and cleared the queue.",
+      ephemeral: true,
+    });
+  }
+
+  // /queue
+  if (interaction.isChatInputCommand() && interaction.commandName === "queue") {
+    const queue = musicQueues.get(interaction.guildId);
+    if (!queue || queue.length === 0) {
+      return interaction.reply({
+        content: "📭 The queue is empty.",
+        ephemeral: true,
+      });
+    }
+    const list = queue
+      .map((s, i) => `${i === 0 ? "▶️" : `${i}.`} ${s.title}`)
+      .join("\n");
+    return interaction.reply({
+      content: `🎵 **Queue:**\n${list}`,
       ephemeral: true,
     });
   }
@@ -584,6 +795,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     voiceStates.delete(interaction.guildId);
     ttsQueues.delete(interaction.guildId);
     ttsPlaying.delete(interaction.guildId);
+    musicQueues.delete(interaction.guildId); // ← add
+    musicPlayers.get(interaction.guildId)?.stop(); // ← add
+    musicPlayers.delete(interaction.guildId); // ← add
     connection.destroy();
 
     return interaction.reply({
