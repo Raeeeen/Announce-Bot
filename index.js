@@ -571,28 +571,38 @@ async function playNextSong(guildId) {
 
     if (!results.length) throw new Error("No SoundCloud results found");
 
-    const stream = await playdl.stream(results[0].url);
-    const resource = createAudioResource(stream.stream, {
-      inputType: stream.type,
+    console.log(`🎵 Streaming from: ${results[0].url}`);
+
+    const stream = await playdl.stream(results[0].url, {
+      highWaterMark: 1 << 25,
     });
 
-    let player = musicPlayers.get(guildId);
-    if (!player) {
-      player = createAudioPlayer();
-      musicPlayers.set(guildId, player);
-      connection.subscribe(player);
+    const resource = createAudioResource(stream.stream, {
+      inputType: stream.type,
+      inlineVolume: false,
+    });
 
-      player.on(AudioPlayerStatus.Idle, () => {
-        queue.shift();
-        playNextSong(guildId);
-      });
-
-      player.on("error", (e) => {
-        console.error("❌ Music player error:", e.message);
-        queue.shift();
-        playNextSong(guildId);
-      });
+    // Always create a fresh player per song to avoid state issues
+    const oldPlayer = musicPlayers.get(guildId);
+    if (oldPlayer) {
+      oldPlayer.removeAllListeners();
+      oldPlayer.stop(true);
     }
+
+    const player = createAudioPlayer();
+    musicPlayers.set(guildId, player);
+    connection.subscribe(player);
+
+    player.on(AudioPlayerStatus.Idle, () => {
+      queue.shift();
+      playNextSong(guildId);
+    });
+
+    player.on("error", (e) => {
+      console.error("❌ Music player error:", e.message);
+      queue.shift();
+      playNextSong(guildId);
+    });
 
     player.play(resource);
   } catch (e) {
@@ -762,7 +772,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!results.length)
         return interaction.editReply("❌ No results found on SoundCloud.");
 
-      const songTitle = results[0].name || results[0].title || searchQuery; 
+      const songTitle = results[0].name || results[0].title || searchQuery;
 
       if (!musicQueues.has(interaction.guildId))
         musicQueues.set(interaction.guildId, []);
