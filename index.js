@@ -1,3 +1,4 @@
+require("dotenv").config();
 require("ffmpeg-static");
 
 const {
@@ -27,7 +28,16 @@ const mongoose = require("mongoose");
 const gtts = require("gtts");
 const fs = require("fs");
 const path = require("path");
-require("dotenv").config();
+const playdl = require("play-dl");
+
+const cookiePath = path.join("/tmp", "yt_cookies.txt");
+fs.writeFileSync(cookiePath, process.env.YOUTUBE_COOKIE);
+
+playdl.setToken({
+  youtube: {
+    cookie: cookiePath,
+  },
+});
 const ttsQueues = new Map(); // guildId → string[]
 const ttsPlaying = new Map(); // guildId → true (semaphore)
 
@@ -38,12 +48,6 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const Groq = require("groq-sdk");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const conversationHistory = new Map();
-const playdl = require("play-dl");
-playdl.setToken({
-  youtube: {
-    cookie: process.env.YOUTUBE_COOKIE,
-  },
-});
 const musicQueues = new Map(); // guildId → [{ title, url }]
 const musicPlayers = new Map(); // guildId → AudioPlayer
 if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
