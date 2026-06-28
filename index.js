@@ -753,6 +753,9 @@ client.on(Events.MessageCreate, async (message) => {
         await message.reply(reply);
 
         // Speak in voice if bot is joined
+        console.log(
+          `🔍 voiceStates has guild: ${voiceStates.has(message.guildId)}, guildId: ${message.guildId}`,
+        );
         if (voiceStates.has(message.guildId)) {
           speakInVoice(message.guildId, reply);
         }
