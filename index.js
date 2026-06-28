@@ -9,10 +9,23 @@ const {
   ChannelType,
   AttachmentBuilder,
 } = require("discord.js");
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  entersState,
+  getVoiceConnection,
+} = require("@discordjs/voice");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 const mongoose = require("mongoose");
+const gtts = require("gtts");
+const fs = require("fs");
+const path = require("path");
 require("dotenv").config();
+
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -22,8 +35,7 @@ if (!TOKEN || !CLIENT_ID || !MONGODB_URI) {
   process.exit(1);
 }
 
-// ─── MongoDB Schema ───────────────────────────────────────────────────────────
-
+// MongoDB Schema
 const scheduleSchema = new mongoose.Schema({
   id:          { type: String, required: true, unique: true },
   channelId:   { type: String, required: true },
@@ -41,7 +53,7 @@ const scheduleSchema = new mongoose.Schema({
 
 const Schedule = mongoose.model("Schedule", scheduleSchema);
 
-// ─── DB Helpers ───────────────────────────────────────────────────────────────
+// DB Helpers
 
 async function loadSchedules() {
   try {
@@ -79,17 +91,69 @@ async function updateSchedule(entryId, fields) {
   }
 }
 
-// ─── Discord Client ───────────────────────────────────────────────────────────
+// Discord Client
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.MessageContent,
   ],
   partials: ["CHANNEL"],
 });
 
+// Voice State
+
+// guildId → { channelId }
+const voiceStates = new Map();
+
+async function speakInVoice(guildId, text) {
+  const state = voiceStates.get(guildId);
+  if (!state) return;
+
+  const connection = getVoiceConnection(guildId);
+  if (!connection) {
+    voiceStates.delete(guildId);
+    return;
+  }
+
+  return new Promise((resolve) => {
+    const tmpFile = path.join("/tmp", `tts_${Date.now()}.mp3`);
+    const speech = new gtts(text, "en");
+
+    speech.save(tmpFile, async (err) => {
+      if (err) {
+        console.error("❌ TTS generation failed:", err.message);
+        return resolve();
+      }
+
+      try {
+        const player = createAudioPlayer();
+        const resource = createAudioResource(tmpFile);
+        connection.subscribe(player);
+        player.play(resource);
+
+        player.on(AudioPlayerStatus.Idle, () => {
+          try { fs.unlinkSync(tmpFile); } catch {}
+          resolve();
+        });
+
+        player.on("error", (e) => {
+          console.error("❌ Audio player error:", e.message);
+          try { fs.unlinkSync(tmpFile); } catch {}
+          resolve();
+        });
+      } catch (e) {
+        console.error("❌ Failed to play TTS:", e.message);
+        try { fs.unlinkSync(tmpFile); } catch {}
+        resolve();
+      }
+    });
+  });
+}
+
+// Commands
 const commands = [
   new SlashCommandBuilder()
     .setName("announce")
@@ -135,9 +199,27 @@ const commands = [
     .addStringOption((opt) =>
       opt.setName("id").setDescription("Announcement ID").setRequired(true),
     ),
+
+  new SlashCommandBuilder()
+    .setName("join")
+    .setDescription("Join a voice channel and stay until /leave")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addChannelOption((opt) =>
+      opt
+        .setName("channel")
+        .setDescription("Voice channel to join")
+        .addChannelTypes(ChannelType.GuildVoice)
+        .setRequired(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("leave")
+    .setDescription("Leave the voice channel")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+
 ].map((cmd) => cmd.toJSON());
 
-// ─── Time Parsing ─────────────────────────────────────────────────────────────
+// Time Parsing
 
 function parseTime(input) {
   const trimmed = input.trim();
@@ -159,7 +241,7 @@ function parseTime(input) {
   };
 
   let normalized = trimmed;
-  let offsetStr = "+08:00"; // default: PHT
+  let offsetStr = "+08:00";
 
   const tzMatch = normalized.match(/\b([A-Z]{2,5})\s*$/);
   if (tzMatch && tzOffsets[tzMatch[1]]) {
@@ -186,7 +268,7 @@ function genId() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// ─── Timers ───────────────────────────────────────────────────────────────────
+// Timers
 
 const activeTimers = new Map();
 const deleteTimers = new Map();
@@ -219,13 +301,22 @@ async function scheduleAnnouncement(entry) {
         }
       }
 
+      // Send text announcement
       const msg = await channel.send({
         content: textContent,
         files,
         allowedMentions: { parse: ["roles", "users", "everyone"] },
       });
 
-      const deleteDelay = 60 * 60 * 1000; // 1 hour
+      // Speak in voice channel if bot is joined
+      if (voiceStates.has(entry.guildId)) {
+        const ttsText = `Greetings players, ${entry.title}. ${entry.message}`;
+        await speakInVoice(entry.guildId, ttsText).catch((e) =>
+          console.warn("⚠️ TTS failed:", e.message),
+        );
+      }
+
+      const deleteDelay = 60 * 60 * 1000;
       await updateSchedule(entry.id, {
         messageId: msg.id,
         deleteAt: Date.now() + deleteDelay,
@@ -293,7 +384,7 @@ async function restoreSchedules() {
   console.log(`🔁 Restored ${schedules.length - toDelete.length} / ${schedules.length} announcement(s)`);
 }
 
-// ─── Events ───────────────────────────────────────────────────────────────────
+// Events
 
 client.once(Events.ClientReady, () => {
   console.log(`🤖 Bot ready: ${client.user.tag}`);
@@ -303,6 +394,74 @@ client.once(Events.ClientReady, () => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+
+  // /join
+  if (interaction.isChatInputCommand() && interaction.commandName === "join") {
+    const voiceChannel = interaction.options.getChannel("channel");
+
+    const existing = getVoiceConnection(interaction.guildId);
+    if (existing) existing.destroy();
+
+    try {
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: interaction.guildId,
+        adapterCreator: interaction.guild.voiceAdapterCreator,
+        selfDeaf: false,
+      });
+
+      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+
+      voiceStates.set(interaction.guildId, { channelId: voiceChannel.id });
+
+      // Handle unexpected disconnects — auto-reconnect unless /leave was used
+      connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        if (!voiceStates.has(interaction.guildId)) return;
+        try {
+          await Promise.race([
+            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+        } catch {
+          connection.destroy();
+          voiceStates.delete(interaction.guildId);
+        }
+      });
+
+      return interaction.reply({
+        content: `🔊 Joined **${voiceChannel.name}**! I'll stay here and read announcements until you use \`/leave\`.`,
+        ephemeral: true,
+      });
+    } catch (err) {
+      console.error("❌ Failed to join voice channel:", err);
+      voiceStates.delete(interaction.guildId);
+      return interaction.reply({
+        content: "❌ Failed to join the voice channel. Make sure I have permission to connect.",
+        ephemeral: true,
+      });
+    }
+  }
+
+  // /leave
+  if (interaction.isChatInputCommand() && interaction.commandName === "leave") {
+    const connection = getVoiceConnection(interaction.guildId);
+
+    if (!connection) {
+      return interaction.reply({
+        content: "❌ I'm not in a voice channel.",
+        ephemeral: true,
+      });
+    }
+
+    voiceStates.delete(interaction.guildId);
+    connection.destroy();
+
+    return interaction.reply({
+      content: "👋 Left the voice channel.",
+      ephemeral: true,
+    });
+  }
+
   // /announce
   if (interaction.isChatInputCommand() && interaction.commandName === "announce") {
     const channel = interaction.options.getChannel("channel");
@@ -420,6 +579,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // Listen for DMs
+
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (message.guild) return;
@@ -472,16 +632,17 @@ client.on(Events.MessageCreate, async (message) => {
   });
 
   const imageNote = entry.images.length > 0 ? `\n🖼️ Images attached: ${entry.images.length}` : "";
+  const voiceNote = voiceStates.has(pending.guildId) ? `\n🔊 Will also be read aloud in voice channel.` : "";
 
   return message.reply(
     `✅ Announcement **#${entry.id}** scheduled!\n` +
     `📌 Channel: <#${entry.channelId}>\n` +
     `🕐 Sends at: \`${sendDate} PHT\`\n` +
-    `🗑️ Auto-deletes 1 hour after posting.${imageNote}`,
+    `🗑️ Auto-deletes 1 hour after posting.${imageNote}${voiceNote}`,
   );
 });
 
-// ─── HTTP Keep-Alive (for Railway health check) ───────────────────────────────
+// HTTP Keep-Alive
 
 const http = require("http");
 http
@@ -490,7 +651,7 @@ http
     console.log(`🌐 HTTP server running on port ${process.env.PORT || 3000}`),
   );
 
-// ─── Connect to MongoDB, then start bot ──────────────────────────────────────
+// Connect to MongoDB, then start bot
 
 mongoose
   .connect(MONGODB_URI)
