@@ -1,5 +1,16 @@
 require("dotenv").config();
 require("ffmpeg-static");
+const playdl = require("play-dl");
+
+(async () => {
+  try {
+    const clientID = await playdl.getFreeClientID();
+    await playdl.setToken({ soundcloud: { client_id: clientID } });
+    console.log("✅ SoundCloud client ID set");
+  } catch (err) {
+    console.error("⚠️ Failed to set SoundCloud client ID:", err.message);
+  }
+})();
 
 const {
   Client,
@@ -55,7 +66,9 @@ async function getSpotifyTrackName(url) {
   const trackRes = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, {
     headers: { Authorization: `Bearer ${access_token}` },
   });
-  const track = await trackRes.json();
+  const trackText = await trackRes.text();
+  console.log("🎵 Spotify track response:", trackText); // ← add this
+  const track = JSON.parse(trackText);
   return `${track.name} ${track.artists[0].name}`;
 }
 
@@ -551,7 +564,6 @@ async function playNextSong(guildId) {
   if (!connection) return;
 
   try {
-    const playdl = require("play-dl");
     const results = await playdl.search(song.searchQuery, {
       source: { soundcloud: "tracks" },
       limit: 1,
@@ -742,7 +754,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       // Search SoundCloud to verify and get real title
-      const playdl = require("play-dl");
       const results = await playdl.search(searchQuery, {
         source: { soundcloud: "tracks" },
         limit: 1,
