@@ -36,6 +36,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 
 const Groq = require("groq-sdk");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const conversationHistory = new Map();
 
 if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
   console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or MONGODB_URI in .env");
@@ -476,6 +477,41 @@ client.once(Events.ClientReady, () => {
   );
 });
 
+// Put this above the /join handler
+async function joinAndWatch(guildId, voiceChannel, guild) {
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: false,
+  });
+
+  await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    if (!voiceStates.has(guildId)) return;
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      try {
+        connection.destroy();
+      } catch {}
+      try {
+        console.log(`🔄 Rejoining voice channel...`);
+        await joinAndWatch(guildId, voiceChannel, guild);
+      } catch (err) {
+        console.error("❌ Failed to rejoin:", err.message);
+        voiceStates.delete(guildId);
+      }
+    }
+  });
+
+  return connection;
+}
+
 client.on(Events.InteractionCreate, async (interaction) => {
   // /join
   if (interaction.isChatInputCommand() && interaction.commandName === "join") {
@@ -485,30 +521,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (existing) existing.destroy();
 
     try {
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: interaction.guildId,
-        adapterCreator: interaction.guild.voiceAdapterCreator,
-        selfDeaf: false,
-      });
-
-      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-
+      await joinAndWatch(interaction.guildId, voiceChannel, interaction.guild);
       voiceStates.set(interaction.guildId, { channelId: voiceChannel.id });
-
-      // Handle unexpected disconnects — auto-reconnect unless /leave was used
-      connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        if (!voiceStates.has(interaction.guildId)) return;
-        try {
-          await Promise.race([
-            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-          ]);
-        } catch {
-          connection.destroy();
-          voiceStates.delete(interaction.guildId);
-        }
-      });
 
       return interaction.reply({
         content: `🔊 Joined **${voiceChannel.name}**! I'll stay here and read announcements until you use \`/leave\`.`,
@@ -736,6 +750,19 @@ client.on(Events.MessageCreate, async (message) => {
       if (!message.content.trim()) return;
       try {
         await message.channel.sendTyping();
+
+        // Get or create history for this channel
+        if (!conversationHistory.has(message.channelId)) {
+          conversationHistory.set(message.channelId, []);
+        }
+        const history = conversationHistory.get(message.channelId);
+
+        // Add user message to history
+        history.push({ role: "user", content: message.content });
+
+        // Keep last 20 messages to avoid token limits
+        if (history.length > 20) history.splice(0, history.length - 20);
+
         const completion = await groq.chat.completions.create({
           model: "llama-3.3-70b-versatile",
           messages: [
@@ -744,16 +771,20 @@ client.on(Events.MessageCreate, async (message) => {
               content:
                 "You are a helpful assistant in a Discord server. Keep answers concise.",
             },
-            { role: "user", content: message.content },
+            ...history, // ← send full history
           ],
           max_tokens: 500,
         });
+
         const reply =
           completion.choices[0]?.message?.content ||
           "I couldn't generate a response.";
+
+        // Add assistant reply to history
+        history.push({ role: "assistant", content: reply });
+
         await message.reply(reply);
 
-        // Speak in voice if bot is joined
         console.log(
           `🔍 voiceStates has guild: ${voiceStates.has(message.guildId)}, guildId: ${message.guildId}`,
         );
