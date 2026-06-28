@@ -25,30 +25,35 @@ const gtts = require("gtts");
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
+const ttsQueues = new Map(); // guildId → string[]
+const ttsPlaying = new Map(); // guildId → true (semaphore)
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
 
-if (!TOKEN || !CLIENT_ID || !MONGODB_URI) {
+const Groq = require("groq-sdk");
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
   console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or MONGODB_URI in .env");
   process.exit(1);
 }
 
 // MongoDB Schema
 const scheduleSchema = new mongoose.Schema({
-  id:          { type: String, required: true, unique: true },
-  channelId:   { type: String, required: true },
-  title:       { type: String, required: true },
-  sendAt:      { type: Number, required: true },
-  mention:     { type: String, default: null },
-  guildId:     { type: String, required: true },
+  id: { type: String, required: true, unique: true },
+  channelId: { type: String, required: true },
+  title: { type: String, required: true },
+  sendAt: { type: Number, required: true },
+  mention: { type: String, default: null },
+  guildId: { type: String, required: true },
   scheduledBy: { type: String, required: true },
   scheduledAt: { type: Number, required: true },
-  message:     { type: String, default: "" },
-  images:      { type: [String], default: [] },
-  messageId:   { type: String, default: null },
-  deleteAt:    { type: Number, default: null },
+  message: { type: String, default: "" },
+  images: { type: [String], default: [] },
+  messageId: { type: String, default: null },
+  deleteAt: { type: Number, default: null },
 });
 
 const Schedule = mongoose.model("Schedule", scheduleSchema);
@@ -108,13 +113,22 @@ const client = new Client({
 // guildId → { channelId }
 const voiceStates = new Map();
 
-async function speakInVoice(guildId, text) {
-  const state = voiceStates.get(guildId);
-  if (!state) return;
+const listenChannels = new Map();
 
+async function processQueue(guildId) {
+  const queue = ttsQueues.get(guildId);
+  if (!queue || queue.length === 0) {
+    ttsPlaying.delete(guildId);
+    return;
+  }
+
+  const text = queue.shift();
   const connection = getVoiceConnection(guildId);
+
   if (!connection) {
-    voiceStates.delete(guildId);
+    // Bot left voice — clear everything
+    ttsQueues.delete(guildId);
+    ttsPlaying.delete(guildId);
     return;
   }
 
@@ -125,7 +139,8 @@ async function speakInVoice(guildId, text) {
     speech.save(tmpFile, async (err) => {
       if (err) {
         console.error("❌ TTS generation failed:", err.message);
-        return resolve();
+        resolve();
+        return processQueue(guildId); // skip to next
       }
 
       try {
@@ -134,23 +149,42 @@ async function speakInVoice(guildId, text) {
         connection.subscribe(player);
         player.play(resource);
 
-        player.on(AudioPlayerStatus.Idle, () => {
-          try { fs.unlinkSync(tmpFile); } catch {}
+        const cleanup = () => {
+          try {
+            fs.unlinkSync(tmpFile);
+          } catch {}
           resolve();
-        });
+          processQueue(guildId); // play next in queue
+        };
 
-        player.on("error", (e) => {
+        player.once(AudioPlayerStatus.Idle, cleanup);
+        player.once("error", (e) => {
           console.error("❌ Audio player error:", e.message);
-          try { fs.unlinkSync(tmpFile); } catch {}
-          resolve();
+          cleanup();
         });
       } catch (e) {
         console.error("❌ Failed to play TTS:", e.message);
-        try { fs.unlinkSync(tmpFile); } catch {}
+        try {
+          fs.unlinkSync(tmpFile);
+        } catch {}
         resolve();
+        processQueue(guildId);
       }
     });
   });
+}
+
+function speakInVoice(guildId, text) {
+  if (!voiceStates.has(guildId)) return;
+
+  if (!ttsQueues.has(guildId)) ttsQueues.set(guildId, []);
+  ttsQueues.get(guildId).push(text);
+
+  // Only kick off processQueue if nothing is playing right now
+  if (!ttsPlaying.has(guildId)) {
+    ttsPlaying.set(guildId, true);
+    processQueue(guildId);
+  }
 }
 
 // Commands
@@ -217,6 +251,22 @@ const commands = [
     .setDescription("Leave the voice channel")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
+  new SlashCommandBuilder()
+    .setName("listen")
+    .setDescription("Start answering questions in a channel")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addChannelOption((opt) =>
+      opt
+        .setName("channel")
+        .setDescription("Channel to listen to")
+        .addChannelTypes(ChannelType.GuildText)
+        .setRequired(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("unlisten")
+    .setDescription("Stop answering questions in the listened channel")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 ].map((cmd) => cmd.toJSON());
 
 // Time Parsing
@@ -233,11 +283,25 @@ function parseTime(input) {
   }
 
   const tzOffsets = {
-    PHT: "+08:00", PST: "+08:00", JST: "+09:00", KST: "+09:00",
-    SGT: "+08:00", HKT: "+08:00", ICT: "+07:00", WIB: "+07:00",
-    IST: "+05:30", PKT: "+05:00", GMT: "+00:00", UTC: "+00:00",
-    EST: "-05:00", EDT: "-04:00", CDT: "-05:00", CST: "-06:00",
-    MST: "-07:00", MDT: "-06:00", PDT: "-07:00",
+    PHT: "+08:00",
+    PST: "+08:00",
+    JST: "+09:00",
+    KST: "+09:00",
+    SGT: "+08:00",
+    HKT: "+08:00",
+    ICT: "+07:00",
+    WIB: "+07:00",
+    IST: "+05:30",
+    PKT: "+05:00",
+    GMT: "+00:00",
+    UTC: "+00:00",
+    EST: "-05:00",
+    EDT: "-04:00",
+    CDT: "-05:00",
+    CST: "-06:00",
+    MST: "-07:00",
+    MDT: "-06:00",
+    PDT: "-07:00",
   };
 
   let normalized = trimmed;
@@ -292,7 +356,8 @@ async function scheduleAnnouncement(entry) {
             const res = await fetch(url);
             if (res.ok) {
               const buffer = Buffer.from(await res.arrayBuffer());
-              const filename = url.split("/").pop().split("?")[0] || "image.png";
+              const filename =
+                url.split("/").pop().split("?")[0] || "image.png";
               files.push(new AttachmentBuilder(buffer, { name: filename }));
             }
           } catch (fetchErr) {
@@ -310,10 +375,16 @@ async function scheduleAnnouncement(entry) {
 
       // Speak in voice channel if bot is joined
       if (voiceStates.has(entry.guildId)) {
-        const ttsText = `Greetings players, ${entry.title}. ${entry.message}`;
-        await speakInVoice(entry.guildId, ttsText).catch((e) =>
-          console.warn("⚠️ TTS failed:", e.message),
-        );
+        const ttsText = `Greetings players. ${entry.title}. ${entry.message}`;
+
+        // Priority: insert at front of queue
+        if (!ttsQueues.has(entry.guildId)) ttsQueues.set(entry.guildId, []);
+        ttsQueues.get(entry.guildId).unshift(ttsText);
+
+        if (!ttsPlaying.has(entry.guildId)) {
+          ttsPlaying.set(entry.guildId, true);
+          processQueue(entry.guildId);
+        }
       }
 
       const deleteDelay = 60 * 60 * 1000;
@@ -367,7 +438,12 @@ async function restoreSchedules() {
 
     if (entry.messageId && entry.deleteAt) {
       if (entry.deleteAt > now) {
-        scheduleDelete(entry.id, entry.messageId, entry.channelId, entry.deleteAt - now);
+        scheduleDelete(
+          entry.id,
+          entry.messageId,
+          entry.channelId,
+          entry.deleteAt - now,
+        );
       } else {
         toDelete.push(entry.id);
       }
@@ -381,7 +457,9 @@ async function restoreSchedules() {
 
   for (const id of toDelete) await deleteSchedule(id);
 
-  console.log(`🔁 Restored ${schedules.length - toDelete.length} / ${schedules.length} announcement(s)`);
+  console.log(
+    `🔁 Restored ${schedules.length - toDelete.length} / ${schedules.length} announcement(s)`,
+  );
 }
 
 // Events
@@ -394,7 +472,6 @@ client.once(Events.ClientReady, () => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-
   // /join
   if (interaction.isChatInputCommand() && interaction.commandName === "join") {
     const voiceChannel = interaction.options.getChannel("channel");
@@ -436,10 +513,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error("❌ Failed to join voice channel:", err);
       voiceStates.delete(interaction.guildId);
       return interaction.reply({
-        content: "❌ Failed to join the voice channel. Make sure I have permission to connect.",
+        content:
+          "❌ Failed to join the voice channel. Make sure I have permission to connect.",
         ephemeral: true,
       });
     }
+  }
+
+  // /listen
+  if (
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "listen"
+  ) {
+    const channel = interaction.options.getChannel("channel");
+    listenChannels.set(interaction.guildId, channel.id);
+    return interaction.reply({
+      content: `🤖 Now listening in <#${channel.id}>! I'll answer all questions there.`,
+      ephemeral: true,
+    });
+  }
+
+  // /unlisten
+  if (
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "unlisten"
+  ) {
+    if (!listenChannels.has(interaction.guildId)) {
+      return interaction.reply({
+        content: "❌ I'm not listening to any channel.",
+        ephemeral: true,
+      });
+    }
+    listenChannels.delete(interaction.guildId);
+    return interaction.reply({
+      content: "🔇 Stopped listening.",
+      ephemeral: true,
+    });
   }
 
   // /leave
@@ -454,6 +563,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     voiceStates.delete(interaction.guildId);
+    ttsQueues.delete(interaction.guildId);
+    ttsPlaying.delete(interaction.guildId);
     connection.destroy();
 
     return interaction.reply({
@@ -463,7 +574,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   // /announce
-  if (interaction.isChatInputCommand() && interaction.commandName === "announce") {
+  if (
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "announce"
+  ) {
     const channel = interaction.options.getChannel("channel");
     const timeInput = interaction.options.getString("time");
     const title = interaction.options.getString("title");
@@ -472,14 +586,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const testParse = parseTime(timeInput);
     if (!testParse) {
       return interaction.reply({
-        content: "❌ Invalid time format. Try `30m`, `2h`, `June 17 10PM PHT`, or `2025-06-17 22:00 PHT`.",
+        content:
+          "❌ Invalid time format. Try `30m`, `2h`, `June 17 10PM PHT`, or `2025-06-17 22:00 PHT`.",
         ephemeral: true,
       });
     }
 
     if (testParse <= Date.now()) {
       return interaction.reply({
-        content: "❌ That time is already in the past! Please pick a future date/time.",
+        content:
+          "❌ That time is already in the past! Please pick a future date/time.",
         ephemeral: true,
       });
     }
@@ -500,28 +616,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const user = await client.users.fetch(interaction.user.id);
       await user.send(
         `📝 **Please send me your announcement message now!**\n\n` +
-        `> Title: **${title}**\n` +
-        `> Channel: <#${channel.id}>\n\n` +
-        `📎 You can also attach an image — just send it along with your message (or alone).\n` +
-        `⚠️ Type \`cancel\` to cancel.`,
+          `> Title: **${title}**\n` +
+          `> Channel: <#${channel.id}>\n\n` +
+          `📎 You can also attach an image — just send it along with your message (or alone).\n` +
+          `⚠️ Type \`cancel\` to cancel.`,
       );
     } catch (err) {
       awaitingDM.delete(interaction.user.id);
       await interaction.editReply({
-        content: "❌ I couldn't DM you. Please enable DMs from server members and try again.",
+        content:
+          "❌ I couldn't DM you. Please enable DMs from server members and try again.",
       });
     }
   }
 
   // /announcements
-  if (interaction.isChatInputCommand() && interaction.commandName === "announcements") {
+  if (
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "announcements"
+  ) {
     await interaction.deferReply({ ephemeral: true });
 
     let allSchedules;
     try {
       allSchedules = await loadSchedules();
     } catch {
-      return interaction.editReply("❌ Failed to load announcements from database.");
+      return interaction.editReply(
+        "❌ Failed to load announcements from database.",
+      );
     }
 
     const schedules = allSchedules.filter(
@@ -536,8 +658,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .map((s) => {
         const d = new Date(s.sendAt).toLocaleString("en-PH", {
           timeZone: "Asia/Manila",
-          year: "numeric", month: "long", day: "numeric",
-          hour: "2-digit", minute: "2-digit", hour12: true,
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: true,
         });
         const preview = (s.message || "").substring(0, 80);
         const ellipsis = (s.message || "").length > 80 ? "..." : "";
@@ -553,7 +679,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   // /cancelannounce
-  if (interaction.isChatInputCommand() && interaction.commandName === "cancelannounce") {
+  if (
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "cancelannounce"
+  ) {
     await interaction.deferReply({ ephemeral: true });
 
     const id = interaction.options.getString("id").toUpperCase();
@@ -562,19 +691,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       schedules = await loadSchedules();
     } catch {
-      return interaction.editReply("❌ Failed to load announcements from database.");
+      return interaction.editReply(
+        "❌ Failed to load announcements from database.",
+      );
     }
 
     const entry = schedules.find((s) => s.id === id);
     if (!entry) {
-      return interaction.editReply(`❌ No announcement found with ID \`${id}\`.`);
+      return interaction.editReply(
+        `❌ No announcement found with ID \`${id}\`.`,
+      );
     }
 
-    if (activeTimers.has(id)) { clearTimeout(activeTimers.get(id)); activeTimers.delete(id); }
-    if (deleteTimers.has(id)) { clearTimeout(deleteTimers.get(id)); deleteTimers.delete(id); }
+    if (activeTimers.has(id)) {
+      clearTimeout(activeTimers.get(id));
+      activeTimers.delete(id);
+    }
+    if (deleteTimers.has(id)) {
+      clearTimeout(deleteTimers.get(id));
+      deleteTimers.delete(id);
+    }
 
     await deleteSchedule(id);
-    return interaction.editReply(`🗑️ Announcement \`${id}\` has been cancelled.`);
+    return interaction.editReply(
+      `🗑️ Announcement \`${id}\` has been cancelled.`,
+    );
   }
 });
 
@@ -582,12 +723,49 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
-  if (message.guild) return;
+
+  // Handle listened channels (guild messages)
+  if (message.guild) {
+    const listenedChannelId = listenChannels.get(message.guildId);
+    if (listenedChannelId && message.channelId === listenedChannelId) {
+      if (!message.content.trim()) return;
+      try {
+        await message.channel.sendTyping();
+        const completion = await groq.chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a helpful assistant in a Discord server. Keep answers concise.",
+            },
+            { role: "user", content: message.content },
+          ],
+          max_tokens: 500,
+        });
+        const reply =
+          completion.choices[0]?.message?.content ||
+          "I couldn't generate a response.";
+        await message.reply(reply);
+
+        // Speak in voice if bot is joined
+        if (voiceStates.has(message.guildId)) {
+          speakInVoice(message.guildId, reply);
+        }
+      } catch (err) {
+        console.error("❌ Groq API error:", err.message);
+        await message.reply("❌ Failed to get a response. Try again later.");
+      }
+    }
+    return;
+  }
 
   const userId = message.author.id;
 
   if (!awaitingDM.has(userId)) {
-    return message.reply("ℹ️ Use `/announce` in the server first to schedule an announcement.");
+    return message.reply(
+      "ℹ️ Use `/announce` in the server first to schedule an announcement.",
+    );
   }
 
   if (message.content.trim().toLowerCase() === "cancel") {
@@ -627,18 +805,27 @@ client.on(Events.MessageCreate, async (message) => {
 
   const sendDate = new Date(entry.sendAt).toLocaleString("en-PH", {
     timeZone: "Asia/Manila",
-    year: "numeric", month: "long", day: "numeric",
-    hour: "2-digit", minute: "2-digit", hour12: true,
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
   });
 
-  const imageNote = entry.images.length > 0 ? `\n🖼️ Images attached: ${entry.images.length}` : "";
-  const voiceNote = voiceStates.has(pending.guildId) ? `\n🔊 Will also be read aloud in voice channel.` : "";
+  const imageNote =
+    entry.images.length > 0
+      ? `\n🖼️ Images attached: ${entry.images.length}`
+      : "";
+  const voiceNote = voiceStates.has(pending.guildId)
+    ? `\n🔊 Will also be read aloud in voice channel.`
+    : "";
 
   return message.reply(
     `✅ Announcement **#${entry.id}** scheduled!\n` +
-    `📌 Channel: <#${entry.channelId}>\n` +
-    `🕐 Sends at: \`${sendDate} PHT\`\n` +
-    `🗑️ Auto-deletes 1 hour after posting.${imageNote}${voiceNote}`,
+      `📌 Channel: <#${entry.channelId}>\n` +
+      `🕐 Sends at: \`${sendDate} PHT\`\n` +
+      `🗑️ Auto-deletes 1 hour after posting.${imageNote}${voiceNote}`,
   );
 });
 
@@ -646,7 +833,10 @@ client.on(Events.MessageCreate, async (message) => {
 
 const http = require("http");
 http
-  .createServer((req, res) => { res.writeHead(200); res.end("Bot is alive!"); })
+  .createServer((req, res) => {
+    res.writeHead(200);
+    res.end("Bot is alive!");
+  })
   .listen(process.env.PORT || 3000, () =>
     console.log(`🌐 HTTP server running on port ${process.env.PORT || 3000}`),
   );
