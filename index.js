@@ -713,12 +713,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       let songUrl, songTitle;
 
-      const isYoutubeUrl =
-        query.includes("youtube.com/watch") || query.includes("youtu.be/");
       const isSpotifyUrl = query.includes("spotify.com");
 
       if (isSpotifyUrl) {
-        // Convert Spotify → search on YouTube
         const spotifyData = await playdl.spotify(query);
         const searchQuery = `${spotifyData.name} ${spotifyData.artists[0].name}`;
         const results = await playdl.search(searchQuery, { limit: 1 });
@@ -726,15 +723,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.editReply("❌ No results found.");
         songUrl = results[0].url;
         songTitle = results[0].title;
-      } else if (isYoutubeUrl) {
-        const results = await playdl.search(query, { limit: 1 });
-        if (!results.length)
-          return interaction.editReply("❌ No results found.");
-        songUrl = results[0].url;
-        songTitle = results[0].title;
       } else {
-        // Plain search term
-        const results = await playdl.search(query, { limit: 1 });
+        // Extract video ID from YouTube URLs, otherwise treat as search term
+        const ytMatch = query.match(/(?:v=|youtu\.be\/)([^?&]+)/);
+        const searchQuery = ytMatch
+          ? `https://www.youtube.com/watch?v=${ytMatch[1]}`
+          : query;
+        const results = await playdl.search(searchQuery, { limit: 1 });
         if (!results.length)
           return interaction.editReply("❌ No results found.");
         songUrl = results[0].url;
