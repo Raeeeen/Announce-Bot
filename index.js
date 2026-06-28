@@ -559,7 +559,7 @@ async function playNextSong(guildId) {
   }
 
   const song = queue[0];
-  console.log(`🎵 Now playing: ${song.title}`);
+  console.log(`🎵 Now playing: ${song.searchQuery}`);
   const connection = getVoiceConnection(guildId);
   if (!connection) return;
 
@@ -762,7 +762,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!results.length)
         return interaction.editReply("❌ No results found on SoundCloud.");
 
-      const songTitle = results[0].title;
+      const songTitle = results[0].name || results[0].title || searchQuery; 
 
       if (!musicQueues.has(interaction.guildId))
         musicQueues.set(interaction.guildId, []);
