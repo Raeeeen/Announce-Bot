@@ -96,10 +96,8 @@ if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
   process.exit(1);
 }
 const WAKE_WORD = "offline";
-const FOLLOWUP_WINDOW_MS = 20_000;
-const activeSessions = new Map(); // guildId -> timestamp until which wake word isn't required
-const subscribedUsers = new Map(); // guildId -> Set of userIds currently being listened to
-const voiceListenEnabled = new Map(); // guildId -> bool
+const subscribedUsers = new Map();
+const voiceListenEnabled = new Map();
 // MongoDB Schema
 const scheduleSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
@@ -737,23 +735,16 @@ function startListeningToUser(guildId, userId, connection) {
 async function handleVoiceTranscript(guildId, userId, text) {
   if (!(voiceListenEnabled.get(guildId) ?? true)) return;
 
-  const now = Date.now();
-  const sessionActive = (activeSessions.get(guildId) || 0) > now;
   const lower = text.toLowerCase();
   const wakeIndex = lower.indexOf(WAKE_WORD);
 
-  let query;
-  if (wakeIndex !== -1) {
-    query = text.slice(wakeIndex + WAKE_WORD.length).trim();
-    speakInVoice(guildId, "Hello player");
-  } else if (sessionActive) {
-    query = text.trim();
-  } else {
-    return;
-  }
-  if (!query) return;
+  if (wakeIndex === -1) return; // no wake word in this utterance — ignore entirely
 
-  activeSessions.set(guildId, now + FOLLOWUP_WINDOW_MS);
+  const query = text.slice(wakeIndex + WAKE_WORD.length).trim();
+
+  speakInVoice(guildId, "Hello player");
+
+  if (!query) return; // they just said the wake word alone, nothing to answer
 
   const listenedChannelId = listenChannels.get(guildId);
   const historyKey = listenedChannelId || `voice-${guildId}`;
@@ -815,7 +806,6 @@ function attachVoiceListener(guildId, connection) {
 
 function detachVoiceListener(guildId) {
   voiceListenEnabled.delete(guildId);
-  activeSessions.delete(guildId);
   subscribedUsers.delete(guildId);
 }
 
