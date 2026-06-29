@@ -98,6 +98,7 @@ if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
 const WAKE_WORD = "offline";
 const subscribedUsers = new Map();
 const voiceListenEnabled = new Map();
+const transcribeQueues = new Map();
 // MongoDB Schema
 const scheduleSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
@@ -695,41 +696,75 @@ function startListeningToUser(guildId, userId, connection) {
     opusDecoder.destroy();
   };
 
-  opusStream.on("error", (e) => {
-    console.error("❌ Opus stream error:", e.message);
-    cleanupSub();
-  });
-  opusDecoder.on("error", (e) => {
-    console.error("❌ Opus decode error:", e.message);
-    cleanupSub();
-  });
+  opusStream.on("error", (e) => { console.error("❌ Opus stream error:", e.message); cleanupSub(); });
+  opusDecoder.on("error", (e) => { console.error("❌ Opus decode error:", e.message); cleanupSub(); });
 
   opusStream.once("end", async () => {
     cleanupSub();
     const pcm48kStereo = Buffer.concat(pcmChunks);
-    if (pcm48kStereo.length < 48000 * 4 * 0.4) return; // skip clips shorter than ~0.4s
 
-    try {
-      const pcm16kMono = downsampleTo16kMono(pcm48kStereo);
-      const wavBuffer = pcmToWav(pcm16kMono, 16000, 1, 16);
+    // ── Gate 1: minimum length (~0.8s) to contain the wake word "offline"
+    if (pcm48kStereo.length < 48000 * 4 * 0.8) return;
 
-      const transcription = await groq.audio.transcriptions.create({
-        file: await toFile(wavBuffer, `${userId}-${Date.now()}.wav`),
-        model: "whisper-large-v3-turbo",
-        language: "en",
-        response_format: "json",
-        temperature: 0.0,
-      });
+    // ── Gate 2: RMS energy check — skip silence/near-silence
+    const rms = computeRMS(pcm48kStereo);
+    if (rms < 200) return; // tune this threshold to your mic (200 works for most)
 
-      const text = (transcription.text || "").trim();
-      if (text) {
-        console.log(`🎤 Heard from ${userId}: "${text}"`);
-        await handleVoiceTranscript(guildId, userId, text);
-      }
-    } catch (err) {
-      console.error("❌ Transcription failed:", err.message);
-    }
+    // ── Gate 3: queue transcription so we never flood Groq in parallel
+    enqueueTranscription(guildId, userId, pcm48kStereo);
   });
+}
+
+function computeRMS(pcmBuffer) {
+  let sum = 0;
+  for (let i = 0; i < pcmBuffer.length - 1; i += 2) {
+    const sample = pcmBuffer.readInt16LE(i);
+    sum += sample * sample;
+  }
+  return Math.sqrt(sum / (pcmBuffer.length / 2));
+}
+
+async function enqueueTranscription(guildId, userId, pcm48kStereo) {
+  // Chain onto the existing promise for this guild so they run serially
+  const prev = transcribeQueues.get(guildId) ?? Promise.resolve();
+  const next = prev.then(() => runTranscription(guildId, userId, pcm48kStereo));
+  transcribeQueues.set(guildId, next.catch(() => {})); // swallow so chain never breaks
+}
+
+async function runTranscription(guildId, userId, pcm48kStereo, attempt = 0) {
+  try {
+    const pcm16kMono = downsampleTo16kMono(pcm48kStereo);
+    const wavBuffer = pcmToWav(pcm16kMono, 16000, 1, 16);
+
+    const transcription = await groq.audio.transcriptions.create({
+      file: await toFile(wavBuffer, `${userId}-${Date.now()}.wav`),
+      model: "whisper-large-v3-turbo",
+      language: "en",
+      response_format: "json",
+      temperature: 0.0,
+    });
+
+    const text = (transcription.text || "").trim();
+    if (!text) return;
+
+    // ── Gate 4: local wake word check BEFORE doing anything else
+    if (!text.toLowerCase().includes(WAKE_WORD)) {
+      console.log(`🔕 No wake word in: "${text.substring(0, 60)}"`);
+      return;
+    }
+
+    console.log(`🎤 Heard from ${userId}: "${text}"`);
+    await handleVoiceTranscript(guildId, userId, text);
+  } catch (err) {
+    const is429 = err?.message?.includes("429") || err?.status === 429;
+    if (is429 && attempt < 4) {
+      const delay = (attempt + 1) * 4000; // 4s, 8s, 12s, 16s
+      console.warn(`⚠️ Groq 429 — retrying in ${delay / 1000}s (attempt ${attempt + 1})`);
+      await new Promise((r) => setTimeout(r, delay));
+      return runTranscription(guildId, userId, pcm48kStereo, attempt + 1);
+    }
+    console.error("❌ Transcription failed:", err.message);
+  }
 }
 
 async function handleVoiceTranscript(guildId, userId, text) {
