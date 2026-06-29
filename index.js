@@ -1,5 +1,6 @@
 require("dotenv").config();
 require("ffmpeg-static");
+require("discord.js");
 const playdl = require("play-dl");
 
 (async () => {
@@ -22,6 +23,9 @@ const {
   PermissionFlagsBits,
   ChannelType,
   AttachmentBuilder,
+  ActionRowBuilder, // ← add
+  ButtonBuilder, // ← add
+  ButtonStyle, // ← add
 } = require("discord.js");
 const {
   joinVoiceChannel,
@@ -74,10 +78,10 @@ async function getSpotifyTrackName(url) {
 
 const ttsQueues = new Map(); // guildId → string[]
 const ttsPlaying = new Map(); // guildId → true (semaphore)
+const ttsEnabled = new Map();
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
-
 const Groq = require("groq-sdk");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const conversationHistory = new Map();
@@ -200,13 +204,25 @@ async function processQueue(guildId) {
         connection.subscribe(player);
         player.play(resource);
 
+        let done = false;
         const cleanup = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(watchdog);
           try {
             fs.unlinkSync(tmpFile);
           } catch {}
           resolve();
           processQueue(guildId);
         };
+
+        // ★ Watchdog: if Idle/error never fires (e.g. connection died silently), force cleanup
+        const watchdog = setTimeout(() => {
+          console.warn(
+            "⚠️ TTS watchdog: player never reached Idle, forcing cleanup",
+          );
+          cleanup();
+        }, 30_000); // generous — longer than any TTS clip should take
 
         player.once(AudioPlayerStatus.Idle, cleanup);
         player.once("error", (e) => {
@@ -620,16 +636,36 @@ async function joinAndWatch(guildId, voiceChannel, guild) {
         entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
+      // Connection recovered on its own — re-subscribe just in case
+      const player = musicPlayers.get(guildId);
+      if (player) connection.subscribe(player);
     } catch {
       try {
         connection.destroy();
       } catch {}
+
+      // ★ Reset TTS state so it isn't stuck forever
+      ttsPlaying.delete(guildId);
+      const pendingQueue = ttsQueues.get(guildId);
+
       try {
         console.log(`🔄 Rejoining voice channel...`);
-        await joinAndWatch(guildId, voiceChannel, guild);
+        const newConnection = await joinAndWatch(guildId, voiceChannel, guild);
+
+        // ★ Resume TTS queue on the new connection if anything was pending
+        if (
+          pendingQueue &&
+          pendingQueue.length > 0 &&
+          !ttsPlaying.has(guildId)
+        ) {
+          ttsPlaying.set(guildId, true);
+          processQueue(guildId);
+        }
       } catch (err) {
         console.error("❌ Failed to rejoin:", err.message);
         voiceStates.delete(guildId);
+        ttsQueues.delete(guildId);
+        ttsPlaying.delete(guildId);
       }
     }
   });
@@ -643,14 +679,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const voiceChannel = interaction.options.getChannel("channel");
 
     const existing = getVoiceConnection(interaction.guildId);
-    if (existing) existing.destroy();
+    if (existing) {
+      existing.removeAllListeners();
+      existing.destroy();
+    }
+    voiceStates.delete(interaction.guildId);
+    ttsEnabled.delete(interaction.guildId);
 
     try {
       await joinAndWatch(interaction.guildId, voiceChannel, interaction.guild);
       voiceStates.set(interaction.guildId, { channelId: voiceChannel.id });
 
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`tts_toggle_${interaction.guildId}`)
+          .setLabel("🔊 Voice Replies: ON")
+          .setStyle(ButtonStyle.Success),
+      );
+
       return interaction.reply({
         content: `🔊 Joined **${voiceChannel.name}**! I'll stay here and read announcements until you use \`/leave\`.`,
+        components: [row],
         ephemeral: true,
       });
     } catch (err) {
@@ -662,6 +711,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true,
       });
     }
+  }
+
+  if (
+    interaction.isButton() &&
+    interaction.customId.startsWith("tts_toggle_")
+  ) {
+    const guildId = interaction.customId.replace("tts_toggle_", "");
+
+    if (!voiceStates.has(guildId)) {
+      return interaction.reply({
+        content: "❌ I'm not in a voice channel anymore.",
+        ephemeral: true,
+      });
+    }
+
+    const current = ttsEnabled.get(guildId) ?? true;
+    const next = !current;
+    ttsEnabled.set(guildId, next);
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`tts_toggle_${guildId}`)
+        .setLabel(next ? "🔊 Voice Replies: ON" : "🔇 Voice Replies: OFF")
+        .setStyle(next ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
+
+    return interaction.update({ components: [row] }); // edits the same message, no new reply spam
   }
 
   // /listen
@@ -763,6 +839,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.editReply("❌ No results found on SoundCloud.");
 
       const songTitle = results[0].name || results[0].title || searchQuery;
+      const songUrl = results[0].url;
 
       if (!musicQueues.has(interaction.guildId))
         musicQueues.set(interaction.guildId, []);
@@ -845,9 +922,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
     voiceStates.delete(interaction.guildId);
     ttsQueues.delete(interaction.guildId);
     ttsPlaying.delete(interaction.guildId);
-    musicQueues.delete(interaction.guildId); // ← add
-    musicPlayers.get(interaction.guildId)?.stop(); // ← add
-    musicPlayers.delete(interaction.guildId); // ← add
+    ttsEnabled.delete(interaction.guildId); // ← add
+    musicQueues.delete(interaction.guildId);
+    musicPlayers.get(interaction.guildId)?.removeAllListeners(); // ← add
+    musicPlayers.get(interaction.guildId)?.stop();
+    musicPlayers.delete(interaction.guildId);
+
+    connection.removeAllListeners(); // ← add (kills Disconnected rejoin handler)
     connection.destroy();
 
     return interaction.reply({
@@ -1052,7 +1133,10 @@ client.on(Events.MessageCreate, async (message) => {
         console.log(
           `🔍 voiceStates has guild: ${voiceStates.has(message.guildId)}, guildId: ${message.guildId}`,
         );
-        if (voiceStates.has(message.guildId)) {
+        if (
+          voiceStates.has(message.guildId) &&
+          (ttsEnabled.get(message.guildId) ?? true)
+        ) {
           speakInVoice(message.guildId, reply);
         }
       } catch (err) {
