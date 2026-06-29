@@ -198,9 +198,17 @@ async function processQueue(guildId) {
         return processQueue(guildId);
       }
 
-      console.log(`✅ TTS file saved: ${tmpFile}`); // ← add this
+      console.log(`✅ TTS file saved: ${tmpFile}`);
       try {
+        const oldTtsPlayer = ttsPlayers.get(guildId); // ← add
+        if (oldTtsPlayer) {
+          // ← add
+          oldTtsPlayer.removeAllListeners(); // ← add
+          oldTtsPlayer.stop(true); // ← add
+        } // ← add
+
         const player = createAudioPlayer();
+        ttsPlayers.set(guildId, player); // ← add
         const resource = createAudioResource(tmpFile);
         connection.subscribe(player);
         player.play(resource);
@@ -364,6 +372,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName("queue")
     .setDescription("Show the current music queue"),
+
+  new SlashCommandBuilder()
+    .setName("voicepanel")
+    .setDescription("Show the voice reply toggle button again")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 ].map((cmd) => cmd.toJSON());
 
 // Time Parsing
@@ -582,25 +595,21 @@ async function playNextSong(guildId) {
   if (!connection) return;
 
   try {
-    const stream = await playdl.stream(song.url, {
-      highWaterMark: 1 << 25,
-    });
-
+    const stream = await playdl.stream(song.url, { highWaterMark: 1 << 25 });
     const resource = createAudioResource(stream.stream, {
       inputType: stream.type,
       inlineVolume: false,
     });
 
-    const oldTtsPlayer = ttsPlayers.get(guildId);
-    if (oldTtsPlayer) {
-      oldTtsPlayer.removeAllListeners();
-      oldTtsPlayer.stop(true);
+    const oldPlayer = musicPlayers.get(guildId); // ← fixed
+    if (oldPlayer) {
+      oldPlayer.removeAllListeners();
+      oldPlayer.stop(true);
     }
 
     const player = createAudioPlayer();
-    ttsPlayers.set(guildId, player);
+    musicPlayers.set(guildId, player); // ← fixed
     connection.subscribe(player);
-    player.play(resource);
 
     player.on(AudioPlayerStatus.Idle, () => {
       queue.shift();
@@ -613,7 +622,7 @@ async function playNextSong(guildId) {
       playNextSong(guildId);
     });
 
-    player.play(resource);
+    player.play(resource); // ← only once, after listeners attached
   } catch (e) {
     console.error("❌ Failed to play song:", e.message);
     queue.shift();
@@ -752,6 +761,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
     listenChannels.set(interaction.guildId, channel.id);
     return interaction.reply({
       content: `🤖 Now listening in <#${channel.id}>! I'll answer all questions there.`,
+      ephemeral: true,
+    });
+  }
+
+  // /voicepanel
+  if (
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "voicepanel"
+  ) {
+    if (!voiceStates.has(interaction.guildId)) {
+      return interaction.reply({
+        content: "❌ I'm not in a voice channel right now. Use `/join` first.",
+        ephemeral: true,
+      });
+    }
+
+    const enabled = ttsEnabled.get(interaction.guildId) ?? true;
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`tts_toggle_${interaction.guildId}`)
+        .setLabel(enabled ? "🔊 Voice Replies: ON" : "🔇 Voice Replies: OFF")
+        .setStyle(enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
+
+    return interaction.reply({
+      content: "🎛️ Voice reply toggle:",
+      components: [row],
       ephemeral: true,
     });
   }
@@ -922,16 +958,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
+    const ttsPlayer = ttsPlayers.get(interaction.guildId);
+    if (ttsPlayer) {
+      ttsPlayer.removeAllListeners();
+      ttsPlayer.stop(true);
+      ttsPlayers.delete(interaction.guildId);
+    }
+
     voiceStates.delete(interaction.guildId);
     ttsQueues.delete(interaction.guildId);
     ttsPlaying.delete(interaction.guildId);
-    ttsEnabled.delete(interaction.guildId); // ← add
+    ttsEnabled.delete(interaction.guildId);
     musicQueues.delete(interaction.guildId);
-    musicPlayers.get(interaction.guildId)?.removeAllListeners(); // ← add
-    musicPlayers.get(interaction.guildId)?.stop();
+    musicPlayers.get(interaction.guildId)?.removeAllListeners();
+    musicPlayers.get(interaction.guildId)?.stop(true);
     musicPlayers.delete(interaction.guildId);
 
-    connection.removeAllListeners(); // ← add (kills Disconnected rejoin handler)
+    connection.removeAllListeners();
     connection.destroy();
 
     return interaction.reply({
