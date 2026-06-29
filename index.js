@@ -79,6 +79,7 @@ async function getSpotifyTrackName(url) {
 const ttsQueues = new Map(); // guildId → string[]
 const ttsPlaying = new Map(); // guildId → true (semaphore)
 const ttsEnabled = new Map();
+const ttsPlayers = new Map();
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -212,6 +213,7 @@ async function processQueue(guildId) {
           try {
             fs.unlinkSync(tmpFile);
           } catch {}
+          ttsPlayers.delete(guildId); // ← add: confirm this player is no longer "current"
           resolve();
           processQueue(guildId);
         };
@@ -589,15 +591,16 @@ async function playNextSong(guildId) {
       inlineVolume: false,
     });
 
-    const oldPlayer = musicPlayers.get(guildId);
-    if (oldPlayer) {
-      oldPlayer.removeAllListeners();
-      oldPlayer.stop(true);
+    const oldTtsPlayer = ttsPlayers.get(guildId);
+    if (oldTtsPlayer) {
+      oldTtsPlayer.removeAllListeners();
+      oldTtsPlayer.stop(true);
     }
 
     const player = createAudioPlayer();
-    musicPlayers.set(guildId, player);
+    ttsPlayers.set(guildId, player);
     connection.subscribe(player);
+    player.play(resource);
 
     player.on(AudioPlayerStatus.Idle, () => {
       queue.shift();
