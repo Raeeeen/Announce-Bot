@@ -95,7 +95,7 @@ if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
   console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or MONGODB_URI in .env");
   process.exit(1);
 }
-const WAKE_WORD = "hey offline";
+const WAKE_WORD = "offline";
 const FOLLOWUP_WINDOW_MS = 20_000;
 const activeSessions = new Map(); // guildId -> timestamp until which wake word isn't required
 const subscribedUsers = new Map(); // guildId -> Set of userIds currently being listened to
