@@ -2,6 +2,7 @@ require("dotenv").config();
 require("ffmpeg-static");
 require("discord.js");
 const playdl = require("play-dl");
+const prism = require("prism-media");
 
 (async () => {
   try {
@@ -36,6 +37,7 @@ const {
   entersState,
   getVoiceConnection,
   StreamType,
+  EndBehaviorType, // ← add
 } = require("@discordjs/voice");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
@@ -85,6 +87,7 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
 const Groq = require("groq-sdk");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const { toFile } = require("groq-sdk");
 const conversationHistory = new Map();
 const musicQueues = new Map(); // guildId → [{ title, url }]
 const musicPlayers = new Map(); // guildId → AudioPlayer
@@ -92,7 +95,11 @@ if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
   console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or MONGODB_URI in .env");
   process.exit(1);
 }
-
+const WAKE_WORD = "hey offline";
+const FOLLOWUP_WINDOW_MS = 20_000;
+const activeSessions = new Map(); // guildId -> timestamp until which wake word isn't required
+const subscribedUsers = new Map(); // guildId -> Set of userIds currently being listened to
+const voiceListenEnabled = new Map(); // guildId -> bool
 // MongoDB Schema
 const scheduleSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
@@ -630,6 +637,188 @@ async function playNextSong(guildId) {
   }
 }
 
+function pcmToWav(pcmBuffer, sampleRate = 16000, channels = 1, bitDepth = 16) {
+  const byteRate = (sampleRate * channels * bitDepth) / 8;
+  const blockAlign = (channels * bitDepth) / 8;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmBuffer.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcmBuffer.length, 40);
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+function downsampleTo16kMono(buffer) {
+  const ratio = 3; // 48000 / 16000
+  const inSamples = buffer.length / 4; // 2 bytes * 2 channels
+  const outSamples = Math.floor(inSamples / ratio);
+  const out = Buffer.alloc(outSamples * 2);
+  for (let i = 0; i < outSamples; i++) {
+    const byteOffset = Math.floor(i * ratio) * 4;
+    if (byteOffset + 3 >= buffer.length) break;
+    const left = buffer.readInt16LE(byteOffset);
+    const right = buffer.readInt16LE(byteOffset + 2);
+    out.writeInt16LE(Math.round((left + right) / 2), i * 2);
+  }
+  return out;
+}
+
+function startListeningToUser(guildId, userId, connection) {
+  if (!subscribedUsers.has(guildId)) subscribedUsers.set(guildId, new Set());
+  const subs = subscribedUsers.get(guildId);
+  if (subs.has(userId)) return;
+  subs.add(userId);
+
+  const opusStream = connection.receiver.subscribe(userId, {
+    end: { behavior: EndBehaviorType.AfterSilence, duration: 800 },
+  });
+  const opusDecoder = new prism.opus.Decoder({
+    rate: 48000,
+    channels: 2,
+    frameSize: 960,
+  });
+  const pcmChunks = [];
+
+  opusStream.pipe(opusDecoder);
+  opusDecoder.on("data", (chunk) => pcmChunks.push(chunk));
+
+  const cleanupSub = () => {
+    subs.delete(userId);
+    opusStream.destroy();
+    opusDecoder.destroy();
+  };
+
+  opusStream.on("error", (e) => {
+    console.error("❌ Opus stream error:", e.message);
+    cleanupSub();
+  });
+  opusDecoder.on("error", (e) => {
+    console.error("❌ Opus decode error:", e.message);
+    cleanupSub();
+  });
+
+  opusStream.once("end", async () => {
+    cleanupSub();
+    const pcm48kStereo = Buffer.concat(pcmChunks);
+    if (pcm48kStereo.length < 48000 * 4 * 0.4) return; // skip clips shorter than ~0.4s
+
+    try {
+      const pcm16kMono = downsampleTo16kMono(pcm48kStereo);
+      const wavBuffer = pcmToWav(pcm16kMono, 16000, 1, 16);
+
+      const transcription = await groq.audio.transcriptions.create({
+        file: await toFile(wavBuffer, `${userId}-${Date.now()}.wav`),
+        model: "whisper-large-v3-turbo",
+        language: "en",
+        response_format: "json",
+        temperature: 0.0,
+      });
+
+      const text = (transcription.text || "").trim();
+      if (text) {
+        console.log(`🎤 Heard from ${userId}: "${text}"`);
+        await handleVoiceTranscript(guildId, userId, text);
+      }
+    } catch (err) {
+      console.error("❌ Transcription failed:", err.message);
+    }
+  });
+}
+
+async function handleVoiceTranscript(guildId, userId, text) {
+  if (!(voiceListenEnabled.get(guildId) ?? true)) return;
+
+  const now = Date.now();
+  const sessionActive = (activeSessions.get(guildId) || 0) > now;
+  const lower = text.toLowerCase();
+  const wakeIndex = lower.indexOf(WAKE_WORD);
+
+  let query;
+  if (wakeIndex !== -1) {
+    query = text.slice(wakeIndex + WAKE_WORD.length).trim();
+    speakInVoice(guildId, "Hello player");
+  } else if (sessionActive) {
+    query = text.trim();
+  } else {
+    return;
+  }
+  if (!query) return;
+
+  activeSessions.set(guildId, now + FOLLOWUP_WINDOW_MS);
+
+  const listenedChannelId = listenChannels.get(guildId);
+  const historyKey = listenedChannelId || `voice-${guildId}`;
+  if (!conversationHistory.has(historyKey))
+    conversationHistory.set(historyKey, []);
+  const history = conversationHistory.get(historyKey);
+
+  history.push({ role: "user", content: query });
+  if (history.length > 20) history.splice(0, history.length - 20);
+
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a helpful voice assistant in a Discord voice channel. Keep answers concise and conversational, since they will be read aloud.",
+        },
+        ...history,
+      ],
+      max_tokens: 300,
+    });
+
+    const reply =
+      completion.choices[0]?.message?.content ||
+      "Sorry, I couldn't think of a response.";
+    history.push({ role: "assistant", content: reply });
+
+    speakInVoice(guildId, reply);
+
+    if (listenedChannelId) {
+      const channel = await client.channels
+        .fetch(listenedChannelId)
+        .catch(() => null);
+      if (channel)
+        channel
+          .send(`🎤 <@${userId}> asked (voice): *${query}*\n💬 ${reply}`)
+          .catch(() => {});
+    }
+  } catch (err) {
+    console.error("❌ Groq voice-chat error:", err.message);
+    speakInVoice(guildId, "Sorry, I had trouble answering that.");
+  }
+}
+
+function attachVoiceListener(guildId, connection) {
+  voiceListenEnabled.set(guildId, true);
+  subscribedUsers.delete(guildId);
+  connection.receiver.speaking.on("start", (userId) => {
+    client.users
+      .fetch(userId)
+      .then((user) => {
+        if (!user.bot) startListeningToUser(guildId, userId, connection);
+      })
+      .catch(() => startListeningToUser(guildId, userId, connection));
+  });
+}
+
+function detachVoiceListener(guildId) {
+  voiceListenEnabled.delete(guildId);
+  activeSessions.delete(guildId);
+  subscribedUsers.delete(guildId);
+}
+
 // Put this above the /join handler
 async function joinAndWatch(guildId, voiceChannel, guild) {
   const connection = joinVoiceChannel({
@@ -640,6 +829,7 @@ async function joinAndWatch(guildId, voiceChannel, guild) {
   });
 
   await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+  attachVoiceListener(guildId, connection);
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     if (!voiceStates.has(guildId)) return;
@@ -678,6 +868,7 @@ async function joinAndWatch(guildId, voiceChannel, guild) {
         voiceStates.delete(guildId);
         ttsQueues.delete(guildId);
         ttsPlaying.delete(guildId);
+        detachVoiceListener(guildId);
       }
     }
   });
@@ -973,6 +1164,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     musicPlayers.get(interaction.guildId)?.removeAllListeners();
     musicPlayers.get(interaction.guildId)?.stop(true);
     musicPlayers.delete(interaction.guildId);
+    detachVoiceListener(interaction.guildId);
 
     connection.removeAllListeners();
     connection.destroy();
