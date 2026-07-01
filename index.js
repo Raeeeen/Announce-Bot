@@ -95,7 +95,17 @@ if (!TOKEN || !CLIENT_ID || !MONGODB_URI || !process.env.GROQ_API_KEY) {
   console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or MONGODB_URI in .env");
   process.exit(1);
 }
-const WAKE_WORD = "offline";
+const WAKE_WORDS = ["offline", "off line", "of line"];
+
+// Returns { index, matched } of the first wake word found, or null
+function findWakeWord(lowerText) {
+  for (const w of WAKE_WORDS) {
+    const idx = lowerText.indexOf(w);
+    if (idx !== -1) return { index: idx, matched: w };
+  }
+  return null;
+}
+
 const subscribedUsers = new Map();
 const voiceListenEnabled = new Map();
 const transcribeQueues = new Map();
@@ -182,7 +192,7 @@ async function processQueue(guildId) {
     return;
   }
 
-  const text = queue.shift();
+  const { text, lang } = queue.shift();
   console.log(`🔊 TTS playing: "${text.substring(0, 50)}..."`); // ← add this
   const connection = getVoiceConnection(guildId);
 
@@ -195,7 +205,7 @@ async function processQueue(guildId) {
 
   return new Promise((resolve) => {
     const tmpFile = path.join("/tmp", `tts_${Date.now()}.mp3`);
-    const speech = new gtts(text, "en");
+    const speech = new gtts(text, lang);
 
     speech.save(tmpFile, async (err) => {
       if (err) {
@@ -257,11 +267,11 @@ async function processQueue(guildId) {
   });
 }
 
-function speakInVoice(guildId, text) {
+function speakInVoice(guildId, text, lang = "en") {
   if (!voiceStates.has(guildId)) return;
 
   if (!ttsQueues.has(guildId)) ttsQueues.set(guildId, []);
-  ttsQueues.get(guildId).push(text);
+  ttsQueues.get(guildId).push({ text, lang });
 
   // Only kick off processQueue if nothing is playing right now
   if (!ttsPlaying.has(guildId)) {
@@ -495,7 +505,7 @@ async function scheduleAnnouncement(entry) {
 
         // Priority: insert at front of queue
         if (!ttsQueues.has(entry.guildId)) ttsQueues.set(entry.guildId, []);
-        ttsQueues.get(entry.guildId).unshift(ttsText);
+        ttsQueues.get(entry.guildId).unshift({ text: ttsText, lang: "en" });
 
         if (!ttsPlaying.has(entry.guildId)) {
           ttsPlaying.set(entry.guildId, true);
@@ -696,8 +706,14 @@ function startListeningToUser(guildId, userId, connection) {
     opusDecoder.destroy();
   };
 
-  opusStream.on("error", (e) => { console.error("❌ Opus stream error:", e.message); cleanupSub(); });
-  opusDecoder.on("error", (e) => { console.error("❌ Opus decode error:", e.message); cleanupSub(); });
+  opusStream.on("error", (e) => {
+    console.error("❌ Opus stream error:", e.message);
+    cleanupSub();
+  });
+  opusDecoder.on("error", (e) => {
+    console.error("❌ Opus decode error:", e.message);
+    cleanupSub();
+  });
 
   opusStream.once("end", async () => {
     cleanupSub();
@@ -728,7 +744,10 @@ async function enqueueTranscription(guildId, userId, pcm48kStereo) {
   // Chain onto the existing promise for this guild so they run serially
   const prev = transcribeQueues.get(guildId) ?? Promise.resolve();
   const next = prev.then(() => runTranscription(guildId, userId, pcm48kStereo));
-  transcribeQueues.set(guildId, next.catch(() => {})); // swallow so chain never breaks
+  transcribeQueues.set(
+    guildId,
+    next.catch(() => {}),
+  ); // swallow so chain never breaks
 }
 
 async function runTranscription(guildId, userId, pcm48kStereo, attempt = 0) {
@@ -739,7 +758,6 @@ async function runTranscription(guildId, userId, pcm48kStereo, attempt = 0) {
     const transcription = await groq.audio.transcriptions.create({
       file: await toFile(wavBuffer, `${userId}-${Date.now()}.wav`),
       model: "whisper-large-v3-turbo",
-      language: "en",
       response_format: "json",
       temperature: 0.0,
     });
@@ -748,7 +766,8 @@ async function runTranscription(guildId, userId, pcm48kStereo, attempt = 0) {
     if (!text) return;
 
     // ── Gate 4: local wake word check BEFORE doing anything else
-    if (!text.toLowerCase().includes(WAKE_WORD)) {
+    const hit = findWakeWord(text.toLowerCase());
+    if (!hit) {
       console.log(`🔕 No wake word in: "${text.substring(0, 60)}"`);
       return;
     }
@@ -759,7 +778,9 @@ async function runTranscription(guildId, userId, pcm48kStereo, attempt = 0) {
     const is429 = err?.message?.includes("429") || err?.status === 429;
     if (is429 && attempt < 4) {
       const delay = (attempt + 1) * 4000; // 4s, 8s, 12s, 16s
-      console.warn(`⚠️ Groq 429 — retrying in ${delay / 1000}s (attempt ${attempt + 1})`);
+      console.warn(
+        `⚠️ Groq 429 — retrying in ${delay / 1000}s (attempt ${attempt + 1})`,
+      );
       await new Promise((r) => setTimeout(r, delay));
       return runTranscription(guildId, userId, pcm48kStereo, attempt + 1);
     }
@@ -771,11 +792,10 @@ async function handleVoiceTranscript(guildId, userId, text) {
   if (!(voiceListenEnabled.get(guildId) ?? true)) return;
 
   const lower = text.toLowerCase();
-  const wakeIndex = lower.indexOf(WAKE_WORD);
+  const hit = findWakeWord(lower);
+  if (!hit) return;
 
-  if (wakeIndex === -1) return; // no wake word in this utterance — ignore entirely
-
-  const query = text.slice(wakeIndex + WAKE_WORD.length).trim();
+  const query = text.slice(hit.index + hit.matched.length).trim();
 
   speakInVoice(guildId, "Hello player");
 
@@ -797,7 +817,7 @@ async function handleVoiceTranscript(guildId, userId, text) {
         {
           role: "system",
           content:
-            "You are a helpful voice assistant in a Discord voice channel. Keep answers concise and conversational, since they will be read aloud.",
+            "Ikaw ay helpful voice assistant sa Discord VC. Sumagot sa Taglish, parang kausap mo mga gamer. Panatilihing maikli dahil babasahin nang malakas. Pede kang mag trashtalk tulad ng Bobo mo, Tanga mo or Wala kang utak, kahit masakit na salita pede or bastos",
         },
         ...history,
       ],
@@ -809,7 +829,7 @@ async function handleVoiceTranscript(guildId, userId, text) {
       "Sorry, I couldn't think of a response.";
     history.push({ role: "assistant", content: reply });
 
-    speakInVoice(guildId, reply);
+    speakInVoice(guildId, reply, "tl");
 
     if (listenedChannelId) {
       const channel = await client.channels
@@ -1377,7 +1397,7 @@ client.on(Events.MessageCreate, async (message) => {
             {
               role: "system",
               content:
-                "You are a helpful assistant in a Discord server. Keep answers concise.",
+                "Ikaw ay helpful voice assistant sa Discord VC. Sumagot sa Taglish, parang kausap mo mga gamer. Panatilihing maikli dahil babasahin nang malakas. Pede kang mag trashtalk tulad ng Bobo mo, Tanga mo or Wala kang utak, kahit masakit na salita pede or bastos",
             },
             ...history, // ← send full history
           ],
@@ -1400,7 +1420,7 @@ client.on(Events.MessageCreate, async (message) => {
           voiceStates.has(message.guildId) &&
           (ttsEnabled.get(message.guildId) ?? true)
         ) {
-          speakInVoice(message.guildId, reply);
+          speakInVoice(message.guildId, reply, "tl");
         }
       } catch (err) {
         console.error("❌ Groq API error:", err.message);
