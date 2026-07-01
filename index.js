@@ -42,7 +42,7 @@ const {
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 const mongoose = require("mongoose");
-const gtts = require("gtts");
+const { MsEdgeTTS, OUTPUT_FORMAT } = require("msedge-tts");
 const fs = require("fs");
 const path = require("path");
 
@@ -193,78 +193,87 @@ async function processQueue(guildId) {
   }
 
   const { text, lang } = queue.shift();
-  console.log(`🔊 TTS playing: "${text.substring(0, 50)}..."`); // ← add this
+  console.log(`🔊 TTS playing: "${text.substring(0, 50)}..."`);
   const connection = getVoiceConnection(guildId);
 
   if (!connection) {
-    console.log("❌ TTS: no voice connection found"); // ← add this
+    console.log("❌ TTS: no voice connection found");
     ttsQueues.delete(guildId);
     ttsPlaying.delete(guildId);
     return;
   }
 
-  return new Promise((resolve) => {
-    const tmpFile = path.join("/tmp", `tts_${Date.now()}.mp3`);
-    const speech = new gtts(text, lang);
+  const tmpFile = path.join("/tmp", `tts_${Date.now()}.mp3`);
 
-    speech.save(tmpFile, async (err) => {
-      if (err) {
-        console.error("❌ TTS generation failed:", err.message);
-        resolve();
-        return processQueue(guildId);
-      }
+  // Pick voice based on lang code you're already passing around
+  const voice = lang === "tl" ? "fil-PH-BlessicaNeural" : "en-US-AriaNeural";
 
-      console.log(`✅ TTS file saved: ${tmpFile}`);
-      try {
-        const oldTtsPlayer = ttsPlayers.get(guildId); // ← add
-        if (oldTtsPlayer) {
-          // ← add
-          oldTtsPlayer.removeAllListeners(); // ← add
-          oldTtsPlayer.stop(true); // ← add
-        } // ← add
+  try {
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    const { audioStream } = await tts.toStream(text);
 
-        const player = createAudioPlayer();
-        ttsPlayers.set(guildId, player); // ← add
-        const resource = createAudioResource(tmpFile);
-        connection.subscribe(player);
-        player.play(resource);
-
-        let done = false;
-        const cleanup = () => {
-          if (done) return;
-          done = true;
-          clearTimeout(watchdog);
-          try {
-            fs.unlinkSync(tmpFile);
-          } catch {}
-          ttsPlayers.delete(guildId); // ← add: confirm this player is no longer "current"
-          resolve();
-          processQueue(guildId);
-        };
-
-        // ★ Watchdog: if Idle/error never fires (e.g. connection died silently), force cleanup
-        const watchdog = setTimeout(() => {
-          console.warn(
-            "⚠️ TTS watchdog: player never reached Idle, forcing cleanup",
-          );
-          cleanup();
-        }, 30_000); // generous — longer than any TTS clip should take
-
-        player.once(AudioPlayerStatus.Idle, cleanup);
-        player.once("error", (e) => {
-          console.error("❌ Audio player error:", e.message);
-          cleanup();
-        });
-      } catch (e) {
-        console.error("❌ Failed to play TTS:", e.message);
-        try {
-          fs.unlinkSync(tmpFile);
-        } catch {}
-        resolve();
-        processQueue(guildId);
-      }
+    const writeStream = fs.createWriteStream(tmpFile);
+    await new Promise((resolve, reject) => {
+      audioStream.pipe(writeStream);
+      audioStream.on("end", resolve);
+      audioStream.on("error", reject);
+      writeStream.on("error", reject);
     });
-  });
+  } catch (err) {
+    console.error(
+      `❌ TTS generation failed for voice="${voice}":`,
+      err.message,
+    );
+    ttsPlayers.delete(guildId);
+    return processQueue(guildId);
+  }
+
+  console.log(`✅ TTS file saved: ${tmpFile}`);
+  try {
+    const oldTtsPlayer = ttsPlayers.get(guildId);
+    if (oldTtsPlayer) {
+      oldTtsPlayer.removeAllListeners();
+      oldTtsPlayer.stop(true);
+    }
+
+    const player = createAudioPlayer();
+    ttsPlayers.set(guildId, player);
+    const resource = createAudioResource(tmpFile);
+    connection.subscribe(player);
+    player.play(resource);
+
+    let done = false;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(watchdog);
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+      ttsPlayers.delete(guildId);
+      return processQueue(guildId);
+    };
+
+    const watchdog = setTimeout(() => {
+      console.warn(
+        "⚠️ TTS watchdog: player never reached Idle, forcing cleanup",
+      );
+      cleanup();
+    }, 30_000);
+
+    player.once(AudioPlayerStatus.Idle, cleanup);
+    player.once("error", (e) => {
+      console.error("❌ Audio player error:", e.message);
+      cleanup();
+    });
+  } catch (e) {
+    console.error("❌ Failed to play TTS:", e.message);
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {}
+    return processQueue(guildId);
+  }
 }
 
 function speakInVoice(guildId, text, lang = "en") {
